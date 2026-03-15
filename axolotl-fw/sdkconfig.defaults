@@ -10,3 +10,10 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # that allocate large stack variables; or better yet - use 
 # `std::thread::Builder::new().stack_size(XXX)` for spawning
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+# SD card FAT filesystem
+CONFIG_FATFS_USE_FASTSEEK=y
+CONFIG_FATFS_LONG_FILENAMES=2
+CONFIG_FATFS_MAX_LFN=255
+
+# SD SPI
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
