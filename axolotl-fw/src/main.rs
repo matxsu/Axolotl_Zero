@@ -11,7 +11,7 @@ use embedded_graphics::{
 };
 use esp_idf_hal::{
     delay::FreeRtos,
-    gpio::{AnyOutputPin, PinDriver, Pull},
+    gpio::{PinDriver, Pull},
     i2c::{I2cConfig, I2cDriver},
     spi::{
         config::{Config, MODE_3},
@@ -89,25 +89,12 @@ fn main() -> anyhow::Result<()> {
     )?;
     let mut pn532 = nfc::Pn532::new(i2c)?;
 
-    // ── SPI3 + SD card ────────────────────────────────────────────────────
-    // SPI3 utilise les mêmes pins physiques que SPI2 mais bus logique séparé
-    let spi3 = SpiDriver::new(
-        peripherals.spi3,
-        peripherals.pins.gpio12,       // SCK  (même fil)
-        peripherals.pins.gpio11,       // MOSI (même fil)
-        Some(peripherals.pins.gpio13), // MISO
-        &SpiDriverConfig::new(),
-    )?;
-    let sd = match storage::SdStorage::new(spi3, peripherals.pins.gpio6.into()) {
-        Ok(s) => {
-            log::info!("SD: OK");
-            Some(s)
-        }
-        Err(e) => {
-            log::warn!("SD: non disponible: {:?}", e);
-            None
-        }
-    };
+    // ── SD card ───────────────────────────────────────────────────────────
+    // TODO: le LCD a consommé SPI2 (ownership). Pour partager le bus avec
+    //   la SD card, refactorer vers T: Borrow<SpiDriver> (SpiDeviceDriver
+    //   et SdSpiHostDriver acceptent tous deux &SpiDriver).
+    //   En attendant, le dump NFC est disponible via les logs UART (115 200 bps).
+    let sd: Option<storage::SdStorage> = None;
 
     // ── Joystick ──────────────────────────────────────────────────────────
     let btn_up = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;

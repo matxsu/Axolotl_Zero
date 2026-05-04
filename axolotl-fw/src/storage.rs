@@ -2,7 +2,7 @@
 //! CS=GPIO6, SPI2 partagé (MOSI=11, SCK=12, MISO=13)
 
 use esp_idf_hal::{
-    gpio::AnyOutputPin,
+    gpio::{AnyInputPin, AnyOutputPin},
     sd::{spi::SdSpiHostDriver, SdCardConfiguration, SdCardDriver},
     spi::SpiDriver,
 };
@@ -18,13 +18,13 @@ pub struct SdStorage<'d> {
 
 impl<'d> SdStorage<'d> {
     /// Initialise le driver SD et monte le filesystem FAT
-    pub fn new(spi: SpiDriver<'d>, cs: AnyOutputPin) -> anyhow::Result<Self> {
+    pub fn new(spi: SpiDriver<'d>, cs: AnyOutputPin<'d>) -> anyhow::Result<Self> {
         let spi_host = SdSpiHostDriver::new(
             spi,
             Some(cs),
-            None::<AnyOutputPin>, // CD
-            None::<AnyOutputPin>, // WP
-            None::<AnyOutputPin>, // INT
+            None::<AnyInputPin>, // CD
+            None::<AnyInputPin>, // WP
+            None::<AnyInputPin>, // INT
             None,                 // wp_active_high
         )?;
 
