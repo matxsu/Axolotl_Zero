@@ -1,0 +1,19 @@
+[package]
+name = "axolotl-zero"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+esp-idf-sys = { version = "0.34.0", features = ["binstart"] }
+esp-idf-hal = "0.43.0"
+esp-idf-svc = "0.48.0"
+log = "0.4"
+anyhow = "1.0"
+embedded-graphics = "0.8.1"
+
+[build-dependencies]
+embuild = "0.31"
+
+[[bin]]
+name = "axolotl-zero"
+path = "src/main.rs"
