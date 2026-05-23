@@ -226,6 +226,7 @@ fn main() -> anyhow::Result<()> {
                     &btn_mid,
                     &btn_lft,
                     &btn_up,
+                    &btn_dwn,
                 )?,
                 3 => run_storage_info(
                     &mut display,
@@ -267,6 +268,7 @@ fn run_nfc_scan<D>(
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -309,11 +311,36 @@ where
                 draw_nfc_status(display, "Aucun dump en RAM")?;
                 FreeRtos::delay_ms(1500);
                 draw_nfc_screen_with_cache(
-                display,
-                None,
-                None,
-                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
-            )?;
+                    display,
+                    None,
+                    None,
+                    last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+                )?;
+            }
+            continue;
+        }
+        // DOWN = browse blocs du dernier dump classic en RAM
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if let Some(dump) = last_dumps.classic.as_ref() {
+                run_view_dump(display, dump, btn_up, btn_dwn, btn_lft)?;
+                draw_nfc_screen_with_cache(
+                    display,
+                    None,
+                    None,
+                    last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+                )?;
+            } else {
+                draw_nfc_status(display, "Aucun dump Classic")?;
+                FreeRtos::delay_ms(1500);
+                draw_nfc_screen_with_cache(
+                    display,
+                    None,
+                    None,
+                    last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+                )?;
             }
             continue;
         }
@@ -648,6 +675,157 @@ where
 
 // ── Storage info ───────────────────────────────────────────────────────────
 
+// ── Dump browser (view blocks on screen) ───────────────────────────────────
+
+fn run_view_dump<D>(
+    display: &mut D,
+    dump: &nfc::MifareDump,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let total = dump.total_blocks();
+    if total == 0 {
+        return Ok(());
+    }
+    let mut current = 0usize;
+    draw_dump_block(display, dump, current)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = if current == 0 { total - 1 } else { current - 1 };
+            draw_dump_block(display, dump, current)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = (current + 1) % total;
+            draw_dump_block(display, dump, current)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn draw_dump_block<D>(
+    display: &mut D,
+    dump: &nfc::MifareDump,
+    block: usize,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "DUMP VIEWER",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let title = format!("Bloc {:03} / {:03}", block, dump.total_blocks() - 1);
+    Text::with_text_style(
+        &title,
+        Point::new(120, 55),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    if !dump.readable[block] {
+        Text::with_text_style(
+            "<non lisible>",
+            Point::new(120, 120),
+            MonoTextStyle::new(&FONT_10X20, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    } else {
+        let d = &dump.blocks[block];
+        let line1 = format!(
+            "{:02X} {:02X} {:02X} {:02X}  {:02X} {:02X} {:02X} {:02X}",
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+        );
+        let line2 = format!(
+            "{:02X} {:02X} {:02X} {:02X}  {:02X} {:02X} {:02X} {:02X}",
+            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]
+        );
+        Text::with_text_style(
+            &line1,
+            Point::new(120, 100),
+            MonoTextStyle::new(&FONT_6X10, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            &line2,
+            Point::new(120, 120),
+            MonoTextStyle::new(&FONT_6X10, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        // Représentation ASCII (caractères imprimables uniquement)
+        let mut ascii = String::with_capacity(16);
+        for &b in d.iter() {
+            ascii.push(if (0x20..0x7F).contains(&b) {
+                b as char
+            } else {
+                '.'
+            });
+        }
+        Text::with_text_style(
+            &ascii,
+            Point::new(120, 150),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    Text::with_text_style(
+        "UP/DOWN: navigate",
+        Point::new(120, 200),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
 fn run_storage_info<D>(
     display: &mut D,
     sd: Option<&dyn SdWrite>,
@@ -727,7 +905,7 @@ where
     if uid.is_none() && has_cached_dump {
         let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
         Text::with_text_style(
-            "UP: re-clone last dump",
+            "UP: re-clone  DOWN: view",
             Point::new(120, 200),
             MonoTextStyle::new(&FONT_6X10, ORANGE),
             centered,
