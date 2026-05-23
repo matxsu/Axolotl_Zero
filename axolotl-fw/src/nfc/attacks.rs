@@ -1,23 +1,44 @@
 //! Attaques MIFARE Classic : dump par dictionnaire de clés.
 //!
-//! Pour chaque secteur (0..16), on tente toutes les clés du dictionnaire
-//! en KeyA puis KeyB. Dès qu'une clé ouvre le secteur, on lit les 4 blocs
-//! et on passe au secteur suivant.
+//! Supporte 1K (16 secteurs × 4 blocs = 64 blocs) et 4K (40 secteurs : 32 × 4 blocs
+//! puis 8 × 16 blocs = 256 blocs). La math secteur/bloc est déléguée à
+//! `axolotl_core::layout::ClassicType` (testé sur host).
 
-use super::dump::MifareDump;
-use super::keys::DEFAULT_KEYS;
-use super::mifare::{MIFARE_AUTH_A, MIFARE_AUTH_B};
-use super::{NfcUid, Pn532};
+use axolotl_core::{
+    keys::DEFAULT_KEYS,
+    layout::ClassicType,
+    protocol::{MIFARE_AUTH_A, MIFARE_AUTH_B},
+    MifareDump, NfcUid,
+};
 
-/// Tente de dumper une carte MIFARE Classic 1K.
-/// Retourne un `MifareDump` dont les champs `readable` indiquent
-/// quels blocs ont pu être lus.
-pub fn dump_all_sectors(pn532: &mut Pn532, uid: &NfcUid) -> MifareDump {
-    let mut dump = MifareDump::new();
+use super::Pn532;
+
+const RE_SELECT_RETRIES: u8 = 5;
+
+/// Dump complet d'une carte MIFARE Classic.
+/// Le type (1K/4K/Mini) est déduit du SAK ; à défaut on assume 1K.
+/// `on_sector(n)` est appelé au début de chaque secteur (0..sector_count-1).
+pub fn dump_all_sectors<F: FnMut(u8, u8)>(
+    pn532: &mut Pn532,
+    uid: &NfcUid,
+    mut on_sector: F,
+) -> Box<MifareDump> {
+    let card_type = ClassicType::from_sak(uid.sak).unwrap_or(ClassicType::Classic1K);
+    let mut dump = Box::new(MifareDump::new(card_type));
     let uid4 = uid_to_4bytes(uid);
+    let total = card_type.sector_count();
 
-    for sector in 0u8..16 {
-        let trailer = sector * 4 + 3;
+    log::info!(
+        "Dump : {:?}, {} secteurs, {} blocs",
+        card_type,
+        total,
+        card_type.block_count()
+    );
+
+    for sector in 0..total {
+        on_sector(sector, total);
+        // sector_trailer ne panique pas car on itère dans la plage valide
+        let trailer = card_type.sector_trailer(sector).unwrap();
         if !try_sector(pn532, &mut dump, sector, trailer, &uid4) {
             log::warn!("Secteur {:02}: aucune cle trouvee", sector);
         }
@@ -34,27 +55,24 @@ fn try_sector(
     trailer: u8,
     uid4: &[u8; 4],
 ) -> bool {
-    // --- Tentative KeyA ---
     for key in DEFAULT_KEYS {
         if pn532.mifare_auth(trailer, MIFARE_AUTH_A, key, uid4).is_ok() {
             log::info!("Secteur {:02}: KeyA {:02X?} OK", sector, key);
             read_sector_blocks(pn532, dump, sector);
             return true;
         }
-        // Après un auth raté la carte est HALTée — re-sélection obligatoire
-        if !pn532.re_select() {
-            return false; // carte retirée
+        if !re_select_with_retry(pn532) {
+            return false;
         }
     }
 
-    // --- Tentative KeyB ---
     for key in DEFAULT_KEYS {
         if pn532.mifare_auth(trailer, MIFARE_AUTH_B, key, uid4).is_ok() {
             log::info!("Secteur {:02}: KeyB {:02X?} OK", sector, key);
             read_sector_blocks(pn532, dump, sector);
             return true;
         }
-        if !pn532.re_select() {
+        if !re_select_with_retry(pn532) {
             return false;
         }
     }
@@ -62,15 +80,42 @@ fn try_sector(
     false
 }
 
-/// Lit les 4 blocs d'un secteur (le secteur doit être authentifié).
+/// Re-sélection avec plusieurs tentatives — la carte peut mettre du temps à
+/// répondre après un cycle RF.
+fn re_select_with_retry(pn532: &mut Pn532) -> bool {
+    for attempt in 0..RE_SELECT_RETRIES {
+        if pn532.re_select() {
+            return true;
+        }
+        log::debug!(
+            "re_select tentative {}/{} echouee",
+            attempt + 1,
+            RE_SELECT_RETRIES
+        );
+    }
+    log::warn!(
+        "re_select: carte non detectee apres {} essais",
+        RE_SELECT_RETRIES
+    );
+    false
+}
+
+/// Lit tous les blocs d'un secteur (le secteur doit être authentifié).
+/// Le nombre de blocs dépend du secteur (4 pour 1K/4K secteurs 0-31, 16 pour 4K 32-39).
 fn read_sector_blocks(pn532: &mut Pn532, dump: &mut MifareDump, sector: u8) {
-    let base = (sector * 4) as usize;
-    for i in 0..4usize {
-        let block = (base + i) as u8;
+    let card_type = dump.card_type;
+    let first = match card_type.sector_first_block(sector) {
+        Some(b) => b,
+        None => return,
+    };
+    let count = card_type.sector_block_count(sector);
+    for i in 0..count {
+        let block = first + i;
+        let idx = block as usize;
         match pn532.mifare_read_block(block) {
             Ok(data) => {
-                dump.blocks[base + i] = data;
-                dump.readable[base + i] = true;
+                dump.blocks[idx] = data;
+                dump.readable[idx] = true;
             }
             Err(e) => {
                 log::warn!("Read bloc {}: {:?}", block, e);
