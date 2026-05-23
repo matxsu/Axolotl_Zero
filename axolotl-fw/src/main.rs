@@ -319,29 +319,26 @@ where
             }
             continue;
         }
-        // DOWN = browse blocs du dernier dump classic en RAM
+        // DOWN = browse blocs du dernier dump en RAM (classic ou UL)
         if btn_dwn.is_low() {
             while btn_dwn.is_low() {
                 FreeRtos::delay_ms(10);
             }
             if let Some(dump) = last_dumps.classic.as_ref() {
                 run_view_dump(display, dump, btn_up, btn_dwn, btn_lft)?;
-                draw_nfc_screen_with_cache(
-                    display,
-                    None,
-                    None,
-                    last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
-                )?;
+            } else if let Some(data) = last_dumps.ultralight.as_ref() {
+                let data_owned = data.clone();
+                run_view_ul_dump(display, &data_owned, btn_up, btn_dwn, btn_lft)?;
             } else {
-                draw_nfc_status(display, "Aucun dump Classic")?;
+                draw_nfc_status(display, "Aucun dump en RAM")?;
                 FreeRtos::delay_ms(1500);
-                draw_nfc_screen_with_cache(
-                    display,
-                    None,
-                    None,
-                    last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
-                )?;
             }
+            draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
             continue;
         }
         match pn532.read_uid() {
@@ -717,6 +714,130 @@ where
         }
         FreeRtos::delay_ms(30);
     }
+    Ok(())
+}
+
+fn run_view_ul_dump<D>(
+    display: &mut D,
+    data: &[u8],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let total = data.len() / 4;
+    if total == 0 {
+        return Ok(());
+    }
+    let mut current = 0usize;
+    draw_ul_page(display, data, current, total)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = if current == 0 { total - 1 } else { current - 1 };
+            draw_ul_page(display, data, current, total)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = (current + 1) % total;
+            draw_ul_page(display, data, current, total)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn draw_ul_page<D>(
+    display: &mut D,
+    data: &[u8],
+    page: usize,
+    total: usize,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "UL/NTAG VIEWER",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let title = format!("Page {:03} / {:03}", page, total - 1);
+    Text::with_text_style(
+        &title,
+        Point::new(120, 55),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let off = page * 4;
+    let d = &data[off..off + 4];
+    let hex = format!("{:02X} {:02X} {:02X} {:02X}", d[0], d[1], d[2], d[3]);
+    Text::with_text_style(
+        &hex,
+        Point::new(120, 110),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let mut ascii = String::with_capacity(4);
+    for &b in d.iter() {
+        ascii.push(if (0x20..0x7F).contains(&b) {
+            b as char
+        } else {
+            '.'
+        });
+    }
+    Text::with_text_style(
+        &ascii,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "UP/DOWN: navigate",
+        Point::new(120, 200),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
     Ok(())
 }
 
