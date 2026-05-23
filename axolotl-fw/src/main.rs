@@ -434,7 +434,8 @@ where
                     txt.as_bytes(),
                 );
             }
-            draw_post_dump(display, readable_count, total)?;
+            let acl = dump.access_summary();
+            draw_post_dump(display, readable_count, total, &acl)?;
             loop {
                 if btn_lft.is_low() {
                     break;
@@ -836,7 +837,12 @@ where
     Ok(())
 }
 
-fn draw_post_dump<D>(display: &mut D, readable: usize, total: usize) -> anyhow::Result<()>
+fn draw_post_dump<D>(
+    display: &mut D,
+    readable: usize,
+    total: usize,
+    acl: &axolotl_core::dump::AccessSummary,
+) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
@@ -848,6 +854,19 @@ where
         "NFC / RFID",
         Point::new(120, 40),
         MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let acl_summary = format!(
+        "ACL fact:{} cust:{} corr:{}",
+        acl.factory, acl.custom, acl.corrupt
+    );
+    Text::with_text_style(
+        &acl_summary,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
         centered,
     )
     .draw(display)
