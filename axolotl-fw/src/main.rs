@@ -15,10 +15,11 @@ use esp_idf_hal::{
     i2c::{I2cConfig, I2cDriver},
     spi::{
         config::{Config, MODE_3},
-        SpiDeviceDriver, SpiDriver, SpiDriverConfig,
+        Dma, SpiDeviceDriver, SpiDriver, SpiDriverConfig,
     },
     units::FromValueType,
 };
+use storage::SdWrite;
 use esp_idf_svc::sys::link_patches;
 use mipidsi::{models::ST7789, Builder};
 
@@ -41,6 +42,14 @@ const MENU_ITEMS: &[&str] = &[
     "Settings",
 ];
 
+/// Cache des derniers dumps en RAM — permet de re-cloner après être revenu
+/// au menu sans re-scanner la carte source. Reset à chaque reboot.
+#[derive(Default)]
+struct LastDumps {
+    classic: Option<Box<nfc::MifareDump>>,
+    ultralight: Option<Vec<u8>>,
+}
+
 fn item_y(i: usize) -> i32 {
     45 + (i as i32 * 36)
 }
@@ -48,20 +57,59 @@ fn item_y(i: usize) -> i32 {
 fn main() -> anyhow::Result<()> {
     link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    // Verbose sur sdspi/sdmmc pour debug — à retirer une fois SD fonctionnelle
+    unsafe {
+        use esp_idf_svc::sys::{esp_log_level_set, esp_log_level_t_ESP_LOG_VERBOSE};
+        esp_log_level_set(b"sdspi_transaction\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
+        esp_log_level_set(b"sdmmc_common\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
+        esp_log_level_set(b"sdmmc_init\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
+        esp_log_level_set(b"sdspi_host\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
+    }
+
     log::info!("Axolotl Zero — booting...");
 
     let peripherals = esp_idf_hal::peripherals::Peripherals::take()?;
 
-    // ── SPI2 + Display ────────────────────────────────────────────────────
-    let spi2 = SpiDriver::new(
+    // ── SPI2 (partagé display + SD card) ─────────────────────────────────
+    // MOSI=11  SCK=12  MISO=13
+    // spi_driver déclaré en premier : dropé en dernier (après tous ses emprunteurs).
+
+    // DMA::Auto(4096) obligatoire : SD card transfère des blocs de 512 bytes,
+    // impossible sans DMA (FIFO SPI limité à 64 bytes sans DMA).
+    let spi_driver = SpiDriver::new(
         peripherals.spi2,
         peripherals.pins.gpio12,
         peripherals.pins.gpio11,
-        None::<esp_idf_hal::gpio::AnyIOPin>,
-        &SpiDriverConfig::new(),
+        Some(peripherals.pins.gpio13),
+        &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
+
+    // Pull-up interne ~45 kΩ sur MISO (GPIO13) APRÈS spi_bus_initialize()
+    // car l'init SPI reconfigure les pads GPIO et peut effacer les pull-ups.
+    // Remplacer par un 10 kΩ externe sur le PCB pour une solution robuste.
+    unsafe { esp_idf_svc::sys::gpio_pullup_en(13) };
+
+    // ── SD card : CS=6 — initialisée EN PREMIER sur le bus (mode neutre) ──
+    // Si la SD s'initialise après le display (MODE_3), le bus SPI reste en
+    // MODE_3 et la SD (MODE_0) ne répond plus à ACMD41.
+    // 200 ms power-up : SD a besoin de ≥74 cycles à 400 kHz après Vcc stable.
+    FreeRtos::delay_ms(200);
+    let sd: Option<storage::SdStorage<'_, &SpiDriver<'_>>> =
+        match storage::SdStorage::new(&spi_driver, peripherals.pins.gpio6.into()) {
+            Ok(s) => {
+                log::info!("SD: prete");
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("SD init: {:?} — fonctionnement sans SD", e);
+                None
+            }
+        };
+
+    // ── Display : CS=8, MODE_3, 40 MHz (après SD pour éviter conflits mode) ──
     let spi_device = SpiDeviceDriver::new(
-        spi2,
+        &spi_driver,
         Some(peripherals.pins.gpio8),
         &Config::new()
             .baudrate(40_000_000_u32.Hz())
@@ -88,13 +136,6 @@ fn main() -> anyhow::Result<()> {
         &I2cConfig::new().baudrate(100_000_u32.Hz()),
     )?;
     let mut pn532 = nfc::Pn532::new(i2c)?;
-
-    // ── SD card ───────────────────────────────────────────────────────────
-    // TODO: le LCD a consommé SPI2 (ownership). Pour partager le bus avec
-    //   la SD card, refactorer vers T: Borrow<SpiDriver> (SpiDeviceDriver
-    //   et SdSpiHostDriver acceptent tous deux &SpiDriver).
-    //   En attendant, le dump NFC est disponible via les logs UART (115 200 bps).
-    let sd: Option<storage::SdStorage> = None;
 
     // ── Joystick ──────────────────────────────────────────────────────────
     let btn_up = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;
@@ -124,6 +165,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Menu ──────────────────────────────────────────────────────────────
     let mut selected: usize = 0;
+    let mut last_dumps = LastDumps::default();
     draw_menu_full(&mut display, selected)?;
 
     loop {
@@ -176,8 +218,20 @@ fn main() -> anyhow::Result<()> {
                 FreeRtos::delay_ms(10);
             }
             match selected {
-                0 => run_nfc_scan(&mut display, &mut pn532, &sd, &btn_mid, &btn_lft)?,
-                3 => run_storage_info(&mut display, &sd, &btn_mid, &btn_lft)?,
+                0 => run_nfc_scan(
+                    &mut display,
+                    &mut pn532,
+                    sd.as_ref().map(|s| s as &dyn SdWrite),
+                    &mut last_dumps,
+                    &btn_mid,
+                    &btn_lft,
+                )?,
+                3 => run_storage_info(
+                    &mut display,
+                    sd.as_ref().map(|s| s as &dyn SdWrite),
+                    &btn_mid,
+                    &btn_lft,
+                )?,
                 _ => {
                     draw_selected(&mut display, selected)?;
                     loop {
@@ -207,7 +261,8 @@ fn main() -> anyhow::Result<()> {
 fn run_nfc_scan<D>(
     display: &mut D,
     pn532: &mut nfc::Pn532,
-    sd: &Option<storage::SdStorage>,
+    sd: Option<&dyn SdWrite>,
+    last_dumps: &mut LastDumps,
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
@@ -215,7 +270,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    draw_nfc_screen(display, None)?;
+    draw_nfc_screen(display, None, None)?;
     loop {
         if btn_lft.is_low() {
             break;
@@ -223,9 +278,17 @@ where
         match pn532.read_uid() {
             Ok(Some(uid)) => {
                 let hex = uid.to_hex();
-                log::info!("NFC UID: {}", hex.as_str());
-                draw_nfc_screen(display, Some(&hex))?;
-                // MID = dump MIFARE
+                let ctype = uid.card_type();
+                log::info!(
+                    "NFC UID: {} SAK={:#04x} ATQA={:02X}{:02X} -> {}",
+                    hex.as_str(),
+                    uid.sak,
+                    uid.atqa[1],
+                    uid.atqa[0],
+                    ctype
+                );
+                draw_nfc_screen(display, Some(&hex), Some(ctype))?;
+
                 let mut waited = 0u32;
                 loop {
                     if btn_lft.is_low() {
@@ -235,61 +298,35 @@ where
                         while btn_mid.is_low() {
                             FreeRtos::delay_ms(10);
                         }
-                        draw_nfc_status(display, "Dump en cours...")?;
-                        match pn532.mifare_dump(&uid) {
-                            Ok(dump) => {
-                                dump.print_log();
-                                // Sauvegarder sur SD si disponible
-                                if let Some(sd) = sd {
-                                    let filename =
-                                        format!("/NFC/dumps/{}.txt", hex.as_str().replace(':', ""));
-                                    let mut data = format!("UID: {}\n\n", hex.as_str());
-                                    for block in 0..64usize {
-                                        if dump.readable[block] {
-                                            let d = &dump.blocks[block];
-                                            data.push_str(&format!(
-                                                "Bloc {:02}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}\n",
-                                                block,
-                                                d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
-                                                d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]
-                                            ));
-                                        } else {
-                                            data.push_str(&format!(
-                                                "Bloc {:02}: -- non lisible --\n",
-                                                block
-                                            ));
-                                        }
-                                    }
-                                    match sd.write_file(&filename, data.as_bytes()) {
-                                        Ok(_) => draw_nfc_status(display, "Dump sauvegarde SD!")?,
-                                        Err(e) => {
-                                            log::warn!("SD write err: {:?}", e);
-                                            draw_nfc_status(display, "Dump OK (SD err)")?;
-                                        }
-                                    }
-                                } else {
-                                    draw_nfc_status(display, "Dump OK! Voir logs")?;
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!("Dump err: {:?}", e);
-                                draw_nfc_status(display, "Dump echoue")?;
-                            }
+
+                        if uid.is_mifare_classic() {
+                            run_nfc_dump_classic(
+                                display, pn532, &uid, &hex, sd, last_dumps,
+                                btn_mid, btn_lft,
+                            )?;
+                        } else if uid.is_ultralight() {
+                            run_nfc_ultralight(
+                                display, pn532, &hex, sd, last_dumps,
+                                btn_mid, btn_lft,
+                            )?;
+                        } else {
+                            draw_nfc_status(display, "Type non supporte")?;
+                            FreeRtos::delay_ms(2000);
                         }
-                        FreeRtos::delay_ms(2000);
-                        draw_nfc_screen(display, Some(&hex))?;
+
+                        draw_nfc_screen(display, Some(&hex), Some(ctype))?;
                         break;
                     }
                     FreeRtos::delay_ms(20);
                     waited += 20;
                     if waited > 5000 {
                         break;
-                    } // retour scan après 5s
+                    }
                 }
                 if btn_lft.is_low() {
                     break;
                 }
-                draw_nfc_screen(display, None)?;
+                draw_nfc_screen(display, None, None)?;
             }
             Ok(None) => {}
             Err(_) => {}
@@ -299,11 +336,273 @@ where
     Ok(())
 }
 
+// ── MIFARE Classic dump + clone ────────────────────────────────────────────
+
+fn run_nfc_dump_classic<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    uid: &nfc::NfcUid,
+    hex: &heapless::String<32>,
+    sd: Option<&dyn SdWrite>,
+    last_dumps: &mut LastDumps,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    match pn532.mifare_dump(uid, |sector, total| {
+        let _ = draw_dump_progress(display, sector, total);
+    }) {
+        Ok(dump) => {
+            nfc::print_dump_log(&dump);
+            let readable_count = dump.readable_count();
+            let total = dump.total_blocks();
+            if let Some(sd) = sd.as_ref() {
+                let uid_str = hex.as_str().replace(':', "");
+                let _ = sd.write_file(
+                    &format!("/NFC/dumps/{}.mfd", uid_str),
+                    &dump.to_mfd_bytes(),
+                );
+                let mut txt = format!("UID: {}\nType: {:?}\n\n", hex.as_str(), dump.card_type);
+                for block in 0..total {
+                    if dump.readable[block] {
+                        let d = &dump.blocks[block];
+                        txt.push_str(&format!(
+                            "Bloc {:03}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}\n",
+                            block,
+                            d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+                            d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]
+                        ));
+                    } else {
+                        txt.push_str(&format!(
+                            "Bloc {:03}: -- non lisible --\n",
+                            block
+                        ));
+                    }
+                }
+                let _ = sd.write_file(
+                    &format!("/NFC/dumps/{}.txt", uid_str),
+                    txt.as_bytes(),
+                );
+            }
+            draw_post_dump(display, readable_count, total)?;
+            loop {
+                if btn_lft.is_low() {
+                    break;
+                }
+                if btn_mid.is_low() {
+                    while btn_mid.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    run_nfc_clone(display, pn532, &dump, btn_lft)?;
+                    break;
+                }
+                FreeRtos::delay_ms(20);
+            }
+            // Cache le dump en RAM pour permettre re-clone depuis le menu
+            last_dumps.classic = Some(dump);
+        }
+        Err(e) => {
+            log::warn!("Dump err: {:?}", e);
+            draw_nfc_status(display, "Dump echoue")?;
+            FreeRtos::delay_ms(2000);
+        }
+    }
+    Ok(())
+}
+
+// ── Ultralight / NTAG read ─────────────────────────────────────────────────
+
+fn run_nfc_ultralight<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    hex: &heapless::String<32>,
+    sd: Option<&dyn SdWrite>,
+    last_dumps: &mut LastDumps,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_status(display, "Lecture UL/NTAG...")?;
+    let data = match pn532.ntag_read_full() {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("UL read err: {:?}", e);
+            draw_nfc_status(display, "Lecture echouee")?;
+            FreeRtos::delay_ms(2000);
+            return Ok(());
+        }
+    };
+
+    let pages = data.len() / 4;
+    log::info!("=== UL/NTAG Dump : {} pages ({} bytes) ===", pages, data.len());
+    for page in 0..pages {
+        let p = &data[page * 4..page * 4 + 4];
+        log::info!(
+            "Page {:03}: {:02X} {:02X} {:02X} {:02X}",
+            page,
+            p[0],
+            p[1],
+            p[2],
+            p[3]
+        );
+    }
+
+    if let Some(sd) = sd.as_ref() {
+        let uid_str = hex.as_str().replace(':', "");
+        let _ = sd.write_file(&format!("/NFC/dumps/{}.bin", uid_str), &data);
+        let mut txt = format!(
+            "UID: {}\nType: Ultralight/NTAG ({} pages, {} bytes)\n\n",
+            hex.as_str(),
+            pages,
+            data.len()
+        );
+        for page in 0..pages {
+            let p = &data[page * 4..page * 4 + 4];
+            txt.push_str(&format!(
+                "Page {:03}: {:02X} {:02X} {:02X} {:02X}\n",
+                page, p[0], p[1], p[2], p[3]
+            ));
+        }
+        let _ = sd.write_file(&format!("/NFC/dumps/{}.txt", uid_str), txt.as_bytes());
+    }
+
+    draw_post_ul_dump(display, pages)?;
+
+    // Boucle MID=clone / LFT=retour
+    loop {
+        if btn_lft.is_low() {
+            break;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_nfc_ultralight_clone(display, pn532, &data, btn_lft)?;
+            break;
+        }
+        FreeRtos::delay_ms(20);
+    }
+
+    last_dumps.ultralight = Some(data);
+    Ok(())
+}
+
+// ── Ultralight clone (écriture vers carte cible UL/NTAG) ──────────────────
+
+fn run_nfc_ultralight_clone<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    data: &[u8],
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_status(display, "Approche UL/NTAG cible...")?;
+
+    let mut target = None;
+    for _ in 0..150u32 {
+        if btn_lft.is_low() {
+            return Ok(());
+        }
+        if let Ok(Some(u)) = pn532.read_uid() {
+            if u.is_ultralight() {
+                target = Some(u);
+                break;
+            }
+            draw_nfc_status(display, "Pas une UL/NTAG")?;
+            FreeRtos::delay_ms(1000);
+            draw_nfc_status(display, "Approche UL/NTAG cible...")?;
+        }
+        FreeRtos::delay_ms(200);
+    }
+
+    if target.is_none() {
+        draw_nfc_status(display, "Timeout - pas de carte")?;
+        FreeRtos::delay_ms(2000);
+        return Ok(());
+    }
+
+    match pn532.ultralight_clone(data, |page, total| {
+        let _ = draw_dump_progress(display, page, total);
+    }) {
+        Ok(n) => {
+            let msg = format!("{} pages ecrites!", n);
+            draw_nfc_status(display, &msg)?;
+        }
+        Err(e) => {
+            log::warn!("UL clone err: {:?}", e);
+            draw_nfc_status(display, "Clone UL echoue")?;
+        }
+    }
+    FreeRtos::delay_ms(2000);
+    Ok(())
+}
+
+// ── NFC clone ──────────────────────────────────────────────────────────────
+
+fn run_nfc_clone<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    dump: &nfc::MifareDump,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_status(display, "Approche carte cible...")?;
+
+    // Attente de la carte cible — 30s timeout
+    let mut target_uid = None;
+    for _ in 0..150u32 {
+        if btn_lft.is_low() {
+            return Ok(());
+        }
+        if let Ok(Some(u)) = pn532.read_uid() {
+            target_uid = Some(u);
+            break;
+        }
+        FreeRtos::delay_ms(200);
+    }
+
+    let tuid = match target_uid {
+        Some(u) => u,
+        None => {
+            draw_nfc_status(display, "Timeout - pas de carte")?;
+            FreeRtos::delay_ms(2000);
+            return Ok(());
+        }
+    };
+
+    match pn532.mifare_restore(&tuid, dump, |sector, total| {
+        let _ = draw_dump_progress(display, sector, total);
+    }) {
+        Ok(n) => {
+            let msg = format!("{} blocs ecrits!", n);
+            draw_nfc_status(display, &msg)?;
+        }
+        Err(e) => {
+            log::warn!("Restore err: {:?}", e);
+            draw_nfc_status(display, "Clone echoue")?;
+        }
+    }
+    FreeRtos::delay_ms(2000);
+    Ok(())
+}
+
 // ── Storage info ───────────────────────────────────────────────────────────
 
 fn run_storage_info<D>(
     display: &mut D,
-    sd: &Option<storage::SdStorage>,
+    sd: Option<&dyn SdWrite>,
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
@@ -322,11 +621,7 @@ where
     .draw(display)
     .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    let status = if sd.is_some() {
-        "SD card: OK"
-    } else {
-        "SD card: absent"
-    };
+    let status = if sd.is_some() { "SD card: OK" } else { "SD card: absent" };
     Text::with_text_style(
         status,
         Point::new(120, 100),
@@ -370,7 +665,11 @@ where
 
 // ── Draw helpers ───────────────────────────────────────────────────────────
 
-fn draw_nfc_screen<D>(display: &mut D, uid: Option<&heapless::String<32>>) -> anyhow::Result<()>
+fn draw_nfc_screen<D>(
+    display: &mut D,
+    uid: Option<&heapless::String<32>>,
+    card_type: Option<&str>,
+) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
@@ -389,12 +688,22 @@ where
         Some(hex) => {
             Text::with_text_style(
                 "Carte detectee!",
-                Point::new(120, 100),
+                Point::new(120, 80),
                 MonoTextStyle::new(&FONT_10X20, GREEN),
                 centered,
             )
             .draw(display)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            if let Some(t) = card_type {
+                Text::with_text_style(
+                    t,
+                    Point::new(120, 105),
+                    MonoTextStyle::new(&FONT_6X10, ORANGE),
+                    centered,
+                )
+                .draw(display)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            }
             Text::with_text_style(
                 "UID:",
                 Point::new(120, 130),
@@ -411,8 +720,13 @@ where
             )
             .draw(display)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            let hint = match card_type {
+                Some(t) if t.contains("Classic") => "MID: dump  LFT: retour",
+                Some(_) => "MID: lire  LFT: retour",
+                None => "LFT: retour",
+            };
             Text::with_text_style(
-                "MID: dump  LFT: retour",
+                hint,
                 Point::new(120, 220),
                 MonoTextStyle::new(&FONT_6X10, GRAY),
                 centered,
@@ -447,6 +761,146 @@ where
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         }
     }
+    Ok(())
+}
+
+fn draw_post_dump<D>(display: &mut D, readable: usize, total: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("{}/{} blocs lus", readable, total);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, if readable > 0 { GREEN } else { GRAY }),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "clone: carte magic requise",
+        Point::new(120, 180),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID: cloner  LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn draw_post_ul_dump<D>(display: &mut D, pages: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("{} pages lues", pages);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, GREEN),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "clone: NTAG/UL cible",
+        Point::new(120, 180),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID: cloner  LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn draw_dump_progress<D>(display: &mut D, sector: u8, total: u8) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "Dump en cours...",
+        Point::new(120, 80),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("Secteur {}/{}", sector + 1, total);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 120),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Rectangle::new(Point::new(20, 150), Size::new(200, 14))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let t = total.max(1) as u32;
+    let filled = ((sector as u32 + 1) * 200 / t).min(200);
+    if filled > 0 {
+        Rectangle::new(Point::new(20, 150), Size::new(filled, 14))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(ORANGE).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
     Ok(())
 }
 
