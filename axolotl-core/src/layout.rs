@@ -81,6 +81,28 @@ impl ClassicType {
         let count = self.sector_block_count(sector) as u16;
         Some((first + count - 1) as u8)
     }
+
+    /// Vrai si `block` est un sector trailer.
+    pub fn is_trailer(self, block: usize) -> bool {
+        if block >= self.block_count() {
+            return false;
+        }
+        match self {
+            Self::Mini | Self::Classic1K => block % 4 == 3,
+            Self::Classic4K => {
+                if block < 128 {
+                    block % 4 == 3
+                } else {
+                    (block - 128) % 16 == 15
+                }
+            }
+        }
+    }
+
+    /// Vrai si `block` est un bloc data (ni bloc 0 manufacturer, ni trailer).
+    pub fn is_data_block(self, block: usize) -> bool {
+        block != 0 && block < self.block_count() && !self.is_trailer(block)
+    }
 }
 
 #[cfg(test)]
@@ -190,5 +212,60 @@ mod tests {
                 next_first
             );
         }
+    }
+
+    #[test]
+    fn classic_1k_trailers() {
+        let c = ClassicType::Classic1K;
+        // Trailers à 3, 7, 11, ..., 63
+        for s in 0..16u8 {
+            let trailer = (s * 4 + 3) as usize;
+            assert!(c.is_trailer(trailer), "block {} doit etre trailer", trailer);
+        }
+        // Blocs 0, 1, 2 ne sont pas des trailers
+        assert!(!c.is_trailer(0));
+        assert!(!c.is_trailer(1));
+        assert!(!c.is_trailer(2));
+        assert!(!c.is_trailer(60));
+        // Hors plage
+        assert!(!c.is_trailer(64));
+    }
+
+    #[test]
+    fn classic_4k_trailers() {
+        let c = ClassicType::Classic4K;
+        // Small sectors 0..31 : trailers à 3, 7, ..., 127
+        for s in 0..32u8 {
+            let trailer = (s * 4 + 3) as usize;
+            assert!(c.is_trailer(trailer), "small trailer {} loupe", trailer);
+        }
+        // Large sectors 32..39 : trailers à 143, 159, ..., 255
+        for s in 0..8u8 {
+            let trailer = 128 + (s as usize) * 16 + 15;
+            assert!(c.is_trailer(trailer), "large trailer {} loupe", trailer);
+        }
+        // Bloc 128 (premier bloc du secteur 32) n'est PAS trailer
+        assert!(!c.is_trailer(128));
+        assert!(!c.is_trailer(142)); // avant-dernier du large secteur 32
+        // Hors plage
+        assert!(!c.is_trailer(256));
+    }
+
+    #[test]
+    fn is_data_block_excludes_block0_and_trailers() {
+        let c = ClassicType::Classic1K;
+        // Block 0 = manufacturer
+        assert!(!c.is_data_block(0));
+        // Block 3 = trailer
+        assert!(!c.is_data_block(3));
+        // Block 1, 2 = data
+        assert!(c.is_data_block(1));
+        assert!(c.is_data_block(2));
+        // Block 60 = data (first of sector 15)
+        assert!(c.is_data_block(60));
+        // Block 63 = trailer
+        assert!(!c.is_data_block(63));
+        // Hors plage
+        assert!(!c.is_data_block(64));
     }
 }

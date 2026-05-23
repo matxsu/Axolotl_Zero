@@ -3,10 +3,13 @@
 //! Aucune dépendance sur esp-idf : ce crate est testable sur host avec
 //! `cargo test -p axolotl-core`.
 
+pub mod acl;
 pub mod card;
+pub mod diff;
 pub mod dump;
 pub mod keys;
 pub mod layout;
+pub mod mfd;
 pub mod protocol;
 
 pub use card::NfcUid;
