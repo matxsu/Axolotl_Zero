@@ -10,7 +10,7 @@ pub mod attacks;
 
 // Re-exports depuis axolotl-core pour que main.rs puisse écrire `nfc::NfcUid`
 // sans changer ses imports actuels.
-pub use axolotl_core::{card::NfcUid, dump::MifareDump, layout::ClassicType};
+pub use axolotl_core::{card::NfcUid, dump::MifareDump};
 
 use axolotl_core::protocol::{MIFARE_AUTH_A, MIFARE_READ, MIFARE_UL_WRITE, MIFARE_WRITE};
 
@@ -402,35 +402,6 @@ impl<'d> Pn532<'d> {
     }
 
     // ── API publique — Ultralight / NTAG ─────────────────────────────────
-
-    /// Lit les 16 premières pages (64 bytes) d'une carte Ultralight/NTAG.
-    /// Pas d'authentification — la carte est déjà sélectionnée par read_uid.
-    /// La commande MIFARE READ (0x30) retourne 4 pages (16 bytes) par appel,
-    /// donc on fait 4 lectures aux pages 0, 4, 8, 12.
-    pub fn ultralight_read_all(&mut self) -> anyhow::Result<[u8; 64]> {
-        let mut data = [0u8; 64];
-        for chunk in 0u8..4 {
-            let start_page = chunk * 4;
-            let params: [u8; 3] = [0x01, MIFARE_READ, start_page];
-            self.send_frame(CMD_IN_DATA_EXCHANGE, &params)?;
-            self.read_ack()?;
-            let resp = self.read_response(CMD_IN_DATA_EXCHANGE)?;
-            let status = resp.get(0).copied().unwrap_or(0xFF);
-            if status != 0x00 {
-                return Err(anyhow::anyhow!(
-                    "UL read page {}: status {:#02x}",
-                    start_page,
-                    status
-                ));
-            }
-            let offset = (chunk as usize) * 16;
-            for i in 0..16 {
-                data[offset + i] = resp.get(i + 1).copied().unwrap_or(0);
-            }
-        }
-        log::info!("UL/NTAG: 64 bytes lus");
-        Ok(data)
-    }
 
     /// Lit une seule page (4 bytes) Ultralight/NTAG via la commande READ.
     /// La carte retourne en réalité 4 pages, on ne garde que la première.
