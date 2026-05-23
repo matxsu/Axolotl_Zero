@@ -225,6 +225,7 @@ fn main() -> anyhow::Result<()> {
                     &mut last_dumps,
                     &btn_mid,
                     &btn_lft,
+                    &btn_up,
                 )?,
                 3 => run_storage_info(
                     &mut display,
@@ -265,15 +266,56 @@ fn run_nfc_scan<D>(
     last_dumps: &mut LastDumps,
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    draw_nfc_screen(display, None, None)?;
+    draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
     loop {
         if btn_lft.is_low() {
             break;
+        }
+        // UP = re-clone du dernier dump en RAM (classic en priorité)
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if let Some(dump) = last_dumps.classic.as_ref() {
+                run_nfc_clone(display, pn532, dump, btn_lft)?;
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            } else if let Some(data) = last_dumps.ultralight.as_ref() {
+                // .clone() pour libérer last_dumps qui est emprunté
+                let data_owned = data.clone();
+                run_nfc_ultralight_clone(display, pn532, &data_owned, btn_lft)?;
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            } else {
+                draw_nfc_status(display, "Aucun dump en RAM")?;
+                FreeRtos::delay_ms(1500);
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            }
+            continue;
         }
         match pn532.read_uid() {
             Ok(Some(uid)) => {
@@ -326,7 +368,12 @@ where
                 if btn_lft.is_low() {
                     break;
                 }
-                draw_nfc_screen(display, None, None)?;
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
             }
             Ok(None) => {}
             Err(_) => {}
@@ -664,6 +711,31 @@ where
 }
 
 // ── Draw helpers ───────────────────────────────────────────────────────────
+
+fn draw_nfc_screen_with_cache<D>(
+    display: &mut D,
+    uid: Option<&heapless::String<32>>,
+    card_type: Option<&str>,
+    has_cached_dump: bool,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_screen(display, uid, card_type)?;
+    if uid.is_none() && has_cached_dump {
+        let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+        Text::with_text_style(
+            "UP: re-clone last dump",
+            Point::new(120, 200),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
 
 fn draw_nfc_screen<D>(
     display: &mut D,
