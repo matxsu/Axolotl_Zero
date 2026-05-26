@@ -13,6 +13,7 @@ use esp_idf_hal::{
     delay::FreeRtos,
     gpio::{PinDriver, Pull},
     i2c::{I2cConfig, I2cDriver},
+    ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver},
     spi::{
         config::{Config, MODE_3},
         Dma, SpiDeviceDriver, SpiDriver, SpiDriverConfig,
@@ -57,16 +58,17 @@ fn item_y(i: usize) -> i32 {
 fn main() -> anyhow::Result<()> {
     link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // Le main task IDF a un stack par défaut trop petit pour la chaîne de
+    // types génériques mipidsi + SPI + embedded-graphics.
+    // On délègue tout à un thread Rust avec 64 KB de stack.
+    std::thread::Builder::new()
+        .stack_size(65536)
+        .spawn(run_app)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("app thread panic"))?
+}
 
-    // Verbose sur sdspi/sdmmc pour debug — à retirer une fois SD fonctionnelle
-    unsafe {
-        use esp_idf_svc::sys::{esp_log_level_set, esp_log_level_t_ESP_LOG_VERBOSE};
-        esp_log_level_set(b"sdspi_transaction\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
-        esp_log_level_set(b"sdmmc_common\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
-        esp_log_level_set(b"sdmmc_init\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
-        esp_log_level_set(b"sdspi_host\0".as_ptr() as _, esp_log_level_t_ESP_LOG_VERBOSE);
-    }
-
+fn run_app() -> anyhow::Result<()> {
     log::info!("Axolotl Zero — booting...");
 
     let peripherals = esp_idf_hal::peripherals::Peripherals::take()?;
@@ -93,8 +95,6 @@ fn main() -> anyhow::Result<()> {
     // ── SD card : CS=6 — initialisée EN PREMIER sur le bus (mode neutre) ──
     // Si la SD s'initialise après le display (MODE_3), le bus SPI reste en
     // MODE_3 et la SD (MODE_0) ne répond plus à ACMD41.
-    // 200 ms power-up : SD a besoin de ≥74 cycles à 400 kHz après Vcc stable.
-    FreeRtos::delay_ms(200);
     let sd: Option<storage::SdStorage<'_, &SpiDriver<'_>>> =
         match storage::SdStorage::new(&spi_driver, peripherals.pins.gpio6.into()) {
             Ok(s) => {
@@ -107,6 +107,15 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
+    // ── Flash interne FAT (fallback persistence quand SD absente) ─────────
+    let internal_fs: Option<storage::InternalFs> = match storage::InternalFs::new() {
+        Ok(fs) => Some(fs),
+        Err(e) => {
+            log::warn!("Flash interne: {:?} — persistence desactivee", e);
+            None
+        }
+    };
+
     // ── Display : CS=8, MODE_3, 40 MHz (après SD pour éviter conflits mode) ──
     let spi_device = SpiDeviceDriver::new(
         &spi_driver,
@@ -117,8 +126,16 @@ fn main() -> anyhow::Result<()> {
     )?;
     let dc = PinDriver::output(peripherals.pins.gpio9)?;
     let rst = PinDriver::output(peripherals.pins.gpio10)?;
-    let mut blk = PinDriver::output(peripherals.pins.gpio46)?;
-    blk.set_high()?;
+    let ledc_timer = LedcTimerDriver::new(
+        peripherals.ledc.timer0,
+        &TimerConfig::new().frequency(1000_u32.Hz()),
+    )?;
+    let mut backlight = LedcDriver::new(
+        peripherals.ledc.channel0,
+        ledc_timer,
+        peripherals.pins.gpio46,
+    )?;
+    backlight.set_duty(backlight.get_max_duty())?;
 
     let di = SPIInterface::new(spi_device, dc);
     let mut display = Builder::new(ST7789, di)
@@ -166,9 +183,30 @@ fn main() -> anyhow::Result<()> {
     // ── Menu ──────────────────────────────────────────────────────────────
     let mut selected: usize = 0;
     let mut last_dumps = LastDumps::default();
+    let mut clock_shown = false;
+    let mut last_input_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     draw_menu_full(&mut display, selected)?;
 
     loop {
+        let now_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        let any_pressed = btn_up.is_low()
+            || btn_dwn.is_low()
+            || btn_lft.is_low()
+            || btn_rht.is_low()
+            || btn_mid.is_low();
+        if any_pressed {
+            if clock_shown {
+                clock_shown = false;
+                draw_menu_full(&mut display, selected)?;
+            }
+            last_input_us = now_us;
+        } else if !clock_shown && (now_us - last_input_us) > 30_000_000 {
+            clock_shown = true;
+            draw_idle_clock(&mut display)?;
+        } else if clock_shown {
+            draw_idle_clock(&mut display)?;
+        }
+
         if btn_up.is_low() {
             let prev = selected;
             selected = if selected == 0 {
@@ -217,11 +255,16 @@ fn main() -> anyhow::Result<()> {
             while btn_mid.is_low() {
                 FreeRtos::delay_ms(10);
             }
+            let storage: Option<&dyn SdWrite> = sd
+                .as_ref()
+                .map(|s| s as &dyn SdWrite)
+                .or_else(|| internal_fs.as_ref().map(|f| f as &dyn SdWrite));
+
             match selected {
                 0 => run_nfc_scan(
                     &mut display,
                     &mut pn532,
-                    sd.as_ref().map(|s| s as &dyn SdWrite),
+                    storage,
                     &mut last_dumps,
                     &btn_mid,
                     &btn_lft,
@@ -230,7 +273,15 @@ fn main() -> anyhow::Result<()> {
                 )?,
                 3 => run_storage_info(
                     &mut display,
-                    sd.as_ref().map(|s| s as &dyn SdWrite),
+                    storage,
+                    &btn_mid,
+                    &btn_lft,
+                )?,
+                4 => run_settings(
+                    &mut display,
+                    &mut backlight,
+                    &btn_up,
+                    &btn_dwn,
                     &btn_mid,
                     &btn_lft,
                 )?,
@@ -1007,6 +1058,587 @@ where
         }
         FreeRtos::delay_ms(20);
     }
+    Ok(())
+}
+
+// ── Idle clock ─────────────────────────────────────────────────────────────
+
+fn draw_idle_clock<D>(display: &mut D) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let h = (ts % 86400) / 3600;
+    let m = (ts % 3600) / 60;
+    let s = ts % 60;
+    let time_str = format!("{:02}:{:02}:{:02}", h, m, s);
+
+    let days_since_epoch = ts / 86400;
+    let (year, month, day) = epoch_days_to_date(days_since_epoch);
+    let date_str = format!("{:02}/{:02}/{}", day, month, year);
+
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        &time_str,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        &date_str,
+        Point::new(120, 130),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "appuie pour revenir",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    FreeRtos::delay_ms(500);
+    Ok(())
+}
+
+fn epoch_days_to_date(days: u64) -> (u32, u32, u32) {
+    let mut y = 1970u32;
+    let mut d = days as u32;
+    loop {
+        let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if d < dy {
+            break;
+        }
+        d -= dy;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 1u32;
+    for &md in &mdays {
+        if d < md {
+            break;
+        }
+        d -= md;
+        m += 1;
+    }
+    (y, m, d + 1)
+}
+
+// ── Settings ───────────────────────────────────────────────────────────────
+
+const SETTINGS_ITEMS: &[&str] = &[
+    "Luminosite",
+    "Lampe torche",
+    "Chronometre",
+    "Minuteur",
+    "Redemarrer",
+    "Eteindre",
+    "A propos",
+];
+
+const SETTINGS_VISIBLE: usize = 5;
+
+fn settings_view_y(slot: usize) -> i32 {
+    36 + (slot as i32 * 38)
+}
+
+fn run_settings<D>(
+    display: &mut D,
+    backlight: &mut LedcDriver<'_>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let mut sel = 0usize;
+    let mut view = 0usize;
+    let mut brightness_pct: u8 = 100;
+    let mut torch_on = false;
+    draw_settings_full(display, sel, view, brightness_pct)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            sel = if sel == 0 { SETTINGS_ITEMS.len() - 1 } else { sel - 1 };
+            if sel < view {
+                view = sel;
+            }
+            draw_settings_full(display, sel, view, brightness_pct)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            sel = (sel + 1) % SETTINGS_ITEMS.len();
+            if sel >= view + SETTINGS_VISIBLE {
+                view = sel + 1 - SETTINGS_VISIBLE;
+            }
+            draw_settings_full(display, sel, view, brightness_pct)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            match sel {
+                0 => {
+                    brightness_pct = match brightness_pct {
+                        25 => 50,
+                        50 => 75,
+                        75 => 100,
+                        _ => 25,
+                    };
+                    torch_on = false;
+                    let duty = backlight.get_max_duty() * brightness_pct as u32 / 100;
+                    let _ = backlight.set_duty(duty);
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                1 => {
+                    torch_on = !torch_on;
+                    let duty = if torch_on {
+                        backlight.get_max_duty()
+                    } else {
+                        backlight.get_max_duty() * brightness_pct as u32 / 100
+                    };
+                    let _ = backlight.set_duty(duty);
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                2 => {
+                    run_stopwatch(display, btn_mid, btn_lft)?;
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                3 => {
+                    run_timer(display, btn_up, btn_dwn, btn_mid, btn_lft)?;
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                4 => {
+                    draw_nfc_status(display, "Redemarrage...")?;
+                    FreeRtos::delay_ms(800);
+                    unsafe { esp_idf_svc::sys::esp_restart() };
+                }
+                5 => {
+                    draw_nfc_status(display, "Extinction...")?;
+                    FreeRtos::delay_ms(500);
+                    unsafe {
+                        esp_idf_svc::sys::esp_sleep_enable_ext0_wakeup(
+                            esp_idf_svc::sys::gpio_num_t_GPIO_NUM_21,
+                            0,
+                        );
+                        esp_idf_svc::sys::esp_deep_sleep_start();
+                    }
+                }
+                6 => {
+                    draw_about(display)?;
+                    loop {
+                        if btn_mid.is_low() || btn_lft.is_low() {
+                            while btn_mid.is_low() || btn_lft.is_low() {
+                                FreeRtos::delay_ms(10);
+                            }
+                            break;
+                        }
+                        FreeRtos::delay_ms(20);
+                    }
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                _ => {}
+            }
+        }
+        FreeRtos::delay_ms(20);
+    }
+    Ok(())
+}
+
+fn draw_settings_full<D>(
+    display: &mut D,
+    selected: usize,
+    view: usize,
+    brightness_pct: u8,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Rectangle::new(Point::new(0, 0), Size::new(240, 28))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Text::with_text_style(
+        "SETTINGS",
+        Point::new(120, 20),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let end = (view + SETTINGS_VISIBLE).min(SETTINGS_ITEMS.len());
+    for abs_i in view..end {
+        let slot = abs_i - view;
+        let is_sel = abs_i == selected;
+        let y = settings_view_y(slot);
+        let (bg_color, txt_color) = if is_sel { (ORANGE, BLACK) } else { (BG, WHITE) };
+        Rectangle::new(Point::new(6, y), Size::new(228, 30))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(bg_color).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let label: std::borrow::Cow<str> = if abs_i == 0 {
+            format!("Luminosite: {}%", brightness_pct).into()
+        } else {
+            SETTINGS_ITEMS[abs_i].into()
+        };
+        Text::new(
+            &label,
+            Point::new(14, y + 22),
+            MonoTextStyle::new(&FONT_10X20, txt_color),
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+fn run_stopwatch<D>(
+    display: &mut D,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    let mut running = false;
+    let mut elapsed_us: i64 = 0;
+    let mut start_us: i64 = 0;
+
+    let draw = |display: &mut D, elapsed_us: i64, running: bool| -> anyhow::Result<()> {
+        let total_s = (elapsed_us / 1_000_000) as u64;
+        let ms = (elapsed_us % 1_000_000) / 10_000;
+        let time_str = format!(
+            "{:02}:{:02}:{:02}.{:02}",
+            total_s / 3600,
+            (total_s % 3600) / 60,
+            total_s % 60,
+            ms
+        );
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "CHRONOMETRE",
+            Point::new(120, 28),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            &time_str,
+            Point::new(120, 110),
+            MonoTextStyle::new(&FONT_10X20, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let hint = if running { "MID: pause  LFT: reset" } else { "MID: start  LFT: quitter" };
+        Text::with_text_style(
+            hint,
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Ok(())
+    };
+
+    draw(display, 0, false)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if running {
+                elapsed_us = 0;
+                running = false;
+                draw(display, 0, false)?;
+            } else {
+                break;
+            }
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if running {
+                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                elapsed_us += now - start_us;
+                running = false;
+            } else {
+                start_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                running = true;
+            }
+        }
+        if running {
+            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+            draw(display, elapsed_us + (now - start_us), true)?;
+        }
+        FreeRtos::delay_ms(50);
+    }
+    Ok(())
+}
+
+fn run_timer<D>(
+    display: &mut D,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    let mut duration_s: u64 = 60;
+
+    let draw_set = |display: &mut D, dur_s: u64| -> anyhow::Result<()> {
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "MINUTEUR",
+            Point::new(120, 28),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let dur_str = format!("{:02}:{:02}", dur_s / 60, dur_s % 60);
+        Text::with_text_style(
+            &dur_str,
+            Point::new(120, 100),
+            MonoTextStyle::new(&FONT_10X20, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "UP/DOWN: regler",
+            Point::new(120, 150),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "MID: demarrer  LFT: quitter",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Ok(())
+    };
+
+    draw_set(display, duration_s)?;
+
+    // Phase 1: set duration
+    let started = loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(());
+        }
+        if btn_up.is_low() {
+            duration_s = duration_s.saturating_add(60).min(5940);
+            draw_set(display, duration_s)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            duration_s = duration_s.saturating_sub(60).max(60);
+            draw_set(display, duration_s)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        }
+        FreeRtos::delay_ms(20);
+    };
+
+    // Phase 2: countdown
+    loop {
+        let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        let elapsed_s = (now - started) / 1_000_000;
+        let remaining = duration_s.saturating_sub(elapsed_s as u64);
+
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "MINUTEUR",
+            Point::new(120, 28),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        let color = if remaining <= 10 { ORANGE } else { WHITE };
+        let rem_str = format!("{:02}:{:02}", remaining / 60, remaining % 60);
+        Text::with_text_style(
+            &rem_str,
+            Point::new(120, 110),
+            MonoTextStyle::new(&FONT_10X20, color),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        Text::with_text_style(
+            "LFT: annuler",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        if remaining == 0 {
+            for _ in 0..6u32 {
+                display.clear(ORANGE).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                FreeRtos::delay_ms(250);
+                display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                Text::with_text_style(
+                    "TERMINE!",
+                    Point::new(120, 120),
+                    MonoTextStyle::new(&FONT_10X20, WHITE),
+                    centered,
+                )
+                .draw(display)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                FreeRtos::delay_ms(250);
+            }
+            loop {
+                if btn_mid.is_low() || btn_lft.is_low() {
+                    while btn_mid.is_low() || btn_lft.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    break;
+                }
+                FreeRtos::delay_ms(20);
+            }
+            break;
+        }
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        FreeRtos::delay_ms(200);
+    }
+    Ok(())
+}
+
+fn draw_about<D>(display: &mut D) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "A propos",
+        Point::new(120, 28),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let ver = concat!("FW v", env!("CARGO_PKG_VERSION"));
+    Text::with_text_style(
+        ver,
+        Point::new(120, 70),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let uptime_s = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000;
+    let uptime_str = format!(
+        "Uptime: {:02}h{:02}m{:02}s",
+        uptime_s / 3600,
+        (uptime_s % 3600) / 60,
+        uptime_s % 60
+    );
+    Text::with_text_style(
+        &uptime_str,
+        Point::new(120, 110),
+        MonoTextStyle::new(&FONT_6X10, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let heap_str = format!("Heap libre: {} B", heap);
+    Text::with_text_style(
+        &heap_str,
+        Point::new(120, 130),
+        MonoTextStyle::new(&FONT_6X10, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID/LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
     Ok(())
 }
 
