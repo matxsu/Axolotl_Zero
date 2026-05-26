@@ -184,6 +184,7 @@ fn run_app() -> anyhow::Result<()> {
     let mut selected: usize = 0;
     let mut last_dumps = LastDumps::default();
     let mut clock_shown = false;
+    let mut clock_last_s: u64 = u64::MAX;
     let mut last_input_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     draw_menu_full(&mut display, selected)?;
 
@@ -197,14 +198,19 @@ fn run_app() -> anyhow::Result<()> {
         if any_pressed {
             if clock_shown {
                 clock_shown = false;
+                clock_last_s = u64::MAX;
                 draw_menu_full(&mut display, selected)?;
             }
             last_input_us = now_us;
         } else if !clock_shown && (now_us - last_input_us) > 30_000_000 {
             clock_shown = true;
-            draw_idle_clock(&mut display)?;
-        } else if clock_shown {
-            draw_idle_clock(&mut display)?;
+        }
+        if clock_shown && !any_pressed {
+            let s = now_us as u64 / 1_000_000;
+            if s != clock_last_s {
+                clock_last_s = s;
+                draw_idle_clock(&mut display)?;
+            }
         }
 
         if btn_up.is_low() {
@@ -1114,7 +1120,6 @@ where
     .draw(display)
     .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    FreeRtos::delay_ms(500);
     Ok(())
 }
 
