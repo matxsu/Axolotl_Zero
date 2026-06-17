@@ -48,6 +48,9 @@ const MENU_ITEMS: &[&str] = &[
 #[derive(Default)]
 struct LastDumps {
     classic: Option<Box<nfc::MifareDump>>,
+    /// Clés trouvées au dump — nécessaires pour reconstruire les trailers au clone
+    /// (le dump renvoie KeyA masqué à 00).
+    classic_keys: Vec<nfc::attacks::SectorKey>,
     ultralight: Option<Vec<u8>>,
 }
 
@@ -155,11 +158,12 @@ fn run_app() -> anyhow::Result<()> {
     let mut pn532 = nfc::Pn532::new(i2c)?;
 
     // ── Joystick ──────────────────────────────────────────────────────────
-    let btn_up = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;
+    let btn_up  = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;
     let btn_dwn = PinDriver::input(peripherals.pins.gpio16, Pull::Up)?;
     let btn_lft = PinDriver::input(peripherals.pins.gpio17, Pull::Up)?;
     let btn_rht = PinDriver::input(peripherals.pins.gpio18, Pull::Up)?;
-    let btn_mid = PinDriver::input(peripherals.pins.gpio21, Pull::Up)?;
+    // GPIO21 tiré à LOW en permanence (LED RGB interne ou court-circuit module) → GPIO14
+    let btn_mid = PinDriver::input(peripherals.pins.gpio14, Pull::Up)?;
 
     // ── Splash ────────────────────────────────────────────────────────────
     display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
@@ -188,6 +192,8 @@ fn run_app() -> anyhow::Result<()> {
     let mut last_input_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     draw_menu_full(&mut display, selected)?;
 
+    // Front descendant pour MID : ne déclenche que sur transition HIGH→LOW.
+    let mut mid_prev_low = btn_mid.is_low();
     loop {
         let now_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
         let any_pressed = btn_up.is_low()
@@ -257,10 +263,13 @@ fn run_app() -> anyhow::Result<()> {
                 FreeRtos::delay_ms(10);
             }
         }
-        if btn_mid.is_low() {
-            while btn_mid.is_low() {
-                FreeRtos::delay_ms(10);
-            }
+        let mid_cur_low = btn_mid.is_low();
+        let mid_edge = mid_cur_low && !mid_prev_low;
+        mid_prev_low = mid_cur_low;
+        if mid_edge {
+            // attend le relâchement, timeout 500ms au cas où bouton coincé
+            let mut t = 0u32;
+            while btn_mid.is_low() && t < 50 { FreeRtos::delay_ms(10); t += 1; }
             let storage: Option<&dyn SdWrite> = sd
                 .as_ref()
                 .map(|s| s as &dyn SdWrite)
@@ -307,8 +316,9 @@ fn run_app() -> anyhow::Result<()> {
                 }
             }
             draw_menu_full(&mut display, selected)?;
-            while btn_mid.is_low() || btn_up.is_low() || btn_dwn.is_low() {
-                FreeRtos::delay_ms(10);
+            let mut t = 0u32;
+            while (btn_mid.is_low() || btn_up.is_low() || btn_dwn.is_low()) && t < 100 {
+                FreeRtos::delay_ms(10); t += 1;
             }
         }
         FreeRtos::delay_ms(20);
@@ -347,7 +357,7 @@ where
                 FreeRtos::delay_ms(10);
             }
             if let Some(dump) = last_dumps.classic.as_ref() {
-                run_nfc_clone(display, pn532, dump, btn_lft)?;
+                run_nfc_clone(display, pn532, dump, &last_dumps.classic_keys, btn_lft)?;
                 draw_nfc_screen_with_cache(
                 display,
                 None,
@@ -425,7 +435,7 @@ where
                         if uid.is_mifare_classic() {
                             run_nfc_dump_classic(
                                 display, pn532, &uid, &hex, sd, last_dumps,
-                                btn_mid, btn_lft,
+                                btn_mid, btn_lft, btn_up, btn_dwn,
                             )?;
                         } else if uid.is_ultralight() {
                             run_nfc_ultralight(
@@ -449,6 +459,10 @@ where
                 if btn_lft.is_low() {
                     break;
                 }
+                // Une carte détectée passe en état ACTIVE et ne répond plus à
+                // REQA tant qu'elle reste dans le champ → on power-cycle le champ
+                // pour pouvoir re-scanner (même carte ou une autre).
+                pn532.reset_field();
                 draw_nfc_screen_with_cache(
                 display,
                 None,
@@ -475,6 +489,8 @@ fn run_nfc_dump_classic<D>(
     last_dumps: &mut LastDumps,
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -483,7 +499,7 @@ where
     match pn532.mifare_dump(uid, |sector, total| {
         let _ = draw_dump_progress(display, sector, total);
     }) {
-        Ok(dump) => {
+        Ok((dump, found_keys)) => {
             nfc::print_dump_log(&dump);
             let readable_count = dump.readable_count();
             let total = dump.total_blocks();
@@ -516,28 +532,273 @@ where
                 );
             }
             let acl = dump.access_summary();
-            draw_post_dump(display, readable_count, total, &acl)?;
+            let can_clone = readable_count > 0;
+            draw_post_dump_with_attack(display, readable_count, total, &acl, !can_clone)?;
             loop {
                 if btn_lft.is_low() {
                     break;
                 }
-                if btn_mid.is_low() {
+                if can_clone && btn_mid.is_low() {
                     while btn_mid.is_low() {
                         FreeRtos::delay_ms(10);
                     }
-                    run_nfc_clone(display, pn532, &dump, btn_lft)?;
+                    run_nfc_clone(display, pn532, &dump, &found_keys, btn_lft)?;
                     break;
+                }
+                // DOWN → sous-menu attaques
+                if btn_dwn.is_low() {
+                    while btn_dwn.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    run_nfc_attacks(display, pn532, uid, &found_keys, btn_up, btn_dwn, btn_mid, btn_lft)?;
+                    draw_post_dump_with_attack(display, readable_count, total, &acl, !can_clone)?;
                 }
                 FreeRtos::delay_ms(20);
             }
-            // Cache le dump en RAM pour permettre re-clone depuis le menu
             last_dumps.classic = Some(dump);
+            last_dumps.classic_keys = found_keys;
         }
         Err(e) => {
             log::warn!("Dump err: {:?}", e);
             draw_nfc_status(display, "Dump echoue")?;
             FreeRtos::delay_ms(2000);
         }
+    }
+    Ok(())
+}
+
+// ── Sous-menu Attaques NFC ─────────────────────────────────────────────────
+
+const ATTACK_ITEMS: &[&str] = &["Probe PRNG", "Darkside", "Nested", "Magic?", "Retour"];
+
+fn draw_attack_menu<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "NFC ATTACK",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    for (i, label) in ATTACK_ITEMS.iter().enumerate() {
+        let y = 40 + i as i32 * 48;
+        let (bg, fg) = if i == selected { (ORANGE, BLACK) } else { (BG, WHITE) };
+        Rectangle::new(Point::new(10, y), Size::new(220, 38))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
+            .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(
+            label,
+            Point::new(20, y + 26),
+            MonoTextStyle::new(&FONT_10X20, fg),
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+fn run_nfc_attacks<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    uid: &nfc::NfcUid,
+    found_keys: &[nfc::attacks::SectorKey],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let mut sel = 0usize;
+    draw_attack_menu(display, sel)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() { FreeRtos::delay_ms(10); }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() { FreeRtos::delay_ms(10); }
+            if sel > 0 { sel -= 1; }
+            draw_attack_menu(display, sel)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() { FreeRtos::delay_ms(10); }
+            if sel < ATTACK_ITEMS.len() - 1 { sel += 1; }
+            draw_attack_menu(display, sel)?;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() { FreeRtos::delay_ms(10); }
+            match sel {
+                0 => {
+                    draw_nfc_status(display, "Probe PRNG...")?;
+                    let probe = pn532.darkside_probe(uid);
+                    let summary = match &probe.prng {
+                        nfc::darkside::PrngType::Fixed(nt) => {
+                            format!("PRNG FIXE\nNT={:08X}\nDarkside OK!", nt)
+                        }
+                        nfc::darkside::PrngType::WeakLfsr { .. } => {
+                            "PRNG FAIBLE\nNested possible".to_string()
+                        }
+                        nfc::darkside::PrngType::Strong => {
+                            "PRNG FORT\nProxmark3 requis".to_string()
+                        }
+                    };
+                    draw_nfc_status(display, &summary)?;
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                1 => {
+                    draw_nfc_status(display, "Probe PRNG d'abord...")?;
+                    let probe = pn532.darkside_probe(uid);
+                    if let nfc::darkside::PrngType::Fixed(nt) = probe.prng {
+                        draw_nfc_status(display, "Darkside\nen cours...")?;
+                        let _key = pn532.darkside_attack(uid, nt, |att, tot| {
+                            let msg = format!("DS {}/{}", att, tot);
+                            let _ = draw_nfc_status(display, &msg);
+                        });
+                        draw_nfc_status(display, "Voir moniteur\npour resultats")?;
+                    } else {
+                        draw_nfc_status(display, "PRNG fort\nDarkside impossible")?;
+                    }
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                2 => {
+                    // Nested attack : cherche une KeyA connue + un secteur cible (KeyB only).
+                    let known_a = found_keys.iter().find(|k| k.key_ab == 0);
+                    let target = found_keys.iter().find(|k| {
+                        k.key_ab == 1
+                            && !found_keys.iter().any(|k2| k2.sector == k.sector && k2.key_ab == 0)
+                    });
+                    match (known_a, target) {
+                        (Some(src), Some(tgt)) => {
+                            let msg = format!(
+                                "Nested S{:02}->S{:02}\n20 samples...",
+                                src.sector, tgt.sector
+                            );
+                            draw_nfc_status(display, &msg)?;
+                            let result = pn532.nested_collect(
+                                uid,
+                                src.sector,
+                                src.key,
+                                tgt.sector,
+                                20,
+                            );
+                            let done_msg = if result.found_key.is_some() {
+                                "Cle trouvee!\nVoir moniteur".to_string()
+                            } else {
+                                format!("{} samples OK\nVoir moniteur", result.samples.len())
+                            };
+                            draw_nfc_status(display, &done_msg)?;
+                        }
+                        (None, _) => {
+                            draw_nfc_status(display, "Nested: aucune\nKeyA connue")?;
+                            log::info!("Nested: lancez le dict attack d'abord");
+                        }
+                        (_, None) => {
+                            draw_nfc_status(display, "Nested: tous\nles secteurs OK")?;
+                            log::info!("Nested: pas de secteur cible (toutes les KeyA connues)");
+                        }
+                    }
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                3 => {
+                    // Détection carte magic gen1a — explicitement demandée par l'utilisateur.
+                    draw_nfc_status(display, "Probe magic...\nApproche la carte")?;
+                    // Re-select pour s'assurer que la carte est présente.
+                    if !pn532.re_select() {
+                        draw_nfc_status(display, "Carte absente")?;
+                        FreeRtos::delay_ms(2000);
+                        draw_attack_menu(display, sel)?;
+                        continue;
+                    }
+                    let is_magic = pn532.detect_magic_gen1a();
+                    if is_magic {
+                        draw_nfc_status(display, "MAGIC GEN1A!\nUID-modifiable")?;
+                        log::info!("*** MAGIC GEN1A detectee ***");
+                    } else {
+                        draw_nfc_status(display, "Carte standard\n(non-magic)")?;
+                    }
+                    FreeRtos::delay_ms(3000);
+                    // Re-select pour restaurer l'etat apres la probe.
+                    pn532.re_select();
+                    draw_attack_menu(display, sel)?;
+                }
+                4 | _ => break,
+            }
+        }
+        FreeRtos::delay_ms(20);
+    }
+    Ok(())
+}
+
+fn draw_post_dump_with_attack<D>(
+    display: &mut D,
+    readable: usize,
+    total: usize,
+    acl: &axolotl_core::dump::AccessSummary,
+    show_attack_hint: bool,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("{}/{} blocs lus", readable, total);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, if readable > 0 { GREEN } else { GRAY }),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let acl_summary = format!("ACL fact:{} cust:{} corr:{}", acl.factory, acl.custom, acl.corrupt);
+    Text::with_text_style(
+        &acl_summary,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    if show_attack_hint {
+        Text::with_text_style(
+            "Dict echoue — cles inconnues",
+            Point::new(120, 170),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+            centered,
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "DWN: Attaques crypto",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GREEN),
+            centered,
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    } else {
+        Text::with_text_style(
+            "MID: clone  DWN: attack",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     }
     Ok(())
 }
@@ -681,49 +942,68 @@ fn run_nfc_clone<D>(
     display: &mut D,
     pn532: &mut nfc::Pn532,
     dump: &nfc::MifareDump,
+    keys: &[nfc::attacks::SectorKey],
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    draw_nfc_status(display, "Approche carte cible...")?;
+    draw_nfc_status(display, "Approche carte magic\n(gen2/CUID)...")?;
 
     // Attente de la carte cible — 30s timeout
-    let mut target_uid = None;
+    let mut found = false;
     for _ in 0..150u32 {
         if btn_lft.is_low() {
             return Ok(());
         }
         if let Ok(Some(u)) = pn532.read_uid() {
-            target_uid = Some(u);
-            break;
+            if u.is_mifare_classic() {
+                found = true;
+                break;
+            }
+            draw_nfc_status(display, "Pas une MIFARE Classic")?;
+            FreeRtos::delay_ms(1000);
+            draw_nfc_status(display, "Approche carte magic\n(gen2/CUID)...")?;
         }
         FreeRtos::delay_ms(200);
     }
+    if !found {
+        draw_nfc_status(display, "Timeout - pas de carte")?;
+        FreeRtos::delay_ms(2000);
+        return Ok(());
+    }
 
-    let tuid = match target_uid {
-        Some(u) => u,
-        None => {
-            draw_nfc_status(display, "Timeout - pas de carte")?;
-            FreeRtos::delay_ms(2000);
-            return Ok(());
-        }
-    };
-
-    match pn532.mifare_restore(&tuid, dump, |sector, total| {
+    // Clone réversible (vraie KeyA + access bits transport FF0780).
+    match pn532.clone_to_magic(dump, keys, true, |sector, total| {
         let _ = draw_dump_progress(display, sector, total);
     }) {
-        Ok(n) => {
-            let msg = format!("{} blocs ecrits!", n);
+        Ok((n, block0)) => {
+            // Read-back : UID réel de la carte clonée.
+            let rb = pn532.read_uid().ok().flatten().map(|u| u.to_hex());
+            let uid_line = rb
+                .as_ref()
+                .map(|h| h.as_str().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let msg = if block0 {
+                format!("{} blocs ecrits\nUID clone -> {}", n, uid_line)
+            } else {
+                // Pas un échec : un lecteur VIGIK auth par KeyA+data, souvent
+                // sans vérifier l'UID. La porte peut s'ouvrir quand même.
+                format!(
+                    "{} blocs ecrits\nUID non ecrit ({})\n-> teste sur la porte!",
+                    n, uid_line
+                )
+            };
             draw_nfc_status(display, &msg)?;
+            log::info!("Clone: {} blocs, bloc0={}, UID lu={}", n, block0, uid_line);
         }
         Err(e) => {
-            log::warn!("Restore err: {:?}", e);
+            log::warn!("Clone err: {:?}", e);
             draw_nfc_status(display, "Clone echoue")?;
         }
     }
-    FreeRtos::delay_ms(2000);
+    FreeRtos::delay_ms(4000);
     Ok(())
 }
 
@@ -1255,7 +1535,7 @@ where
                     FreeRtos::delay_ms(500);
                     unsafe {
                         esp_idf_svc::sys::esp_sleep_enable_ext0_wakeup(
-                            esp_idf_svc::sys::gpio_num_t_GPIO_NUM_21,
+                            esp_idf_svc::sys::gpio_num_t_GPIO_NUM_14,
                             0,
                         );
                         esp_idf_svc::sys::esp_deep_sleep_start();
@@ -1648,6 +1928,31 @@ where
 }
 
 // ── Draw helpers ───────────────────────────────────────────────────────────
+
+/// Affiche une bannière "MAGIC GEN1A" en overlay rouge sur l'écran actuel.
+/// Ne clear pas le fond — ajoute juste l'indicateur en bas de l'écran.
+fn draw_magic_indicator<D>(display: &mut D) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let red = Rgb565::new(31, 0, 0);
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 170), Size::new(240, 24))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(red).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "MAGIC GEN1A",
+        Point::new(120, 188),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    log::info!("*** MAGIC GEN1A — carte UID-modifiable ***");
+    Ok(())
+}
 
 fn draw_nfc_screen_with_cache<D>(
     display: &mut D,
