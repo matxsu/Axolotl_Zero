@@ -569,7 +569,7 @@ where
 
 // ── Sous-menu Attaques NFC ─────────────────────────────────────────────────
 
-const ATTACK_ITEMS: &[&str] = &["Probe PRNG", "Darkside", "Nested", "Magic?", "Retour"];
+const ATTACK_ITEMS: &[&str] = &["Probe PRNG", "Darkside", "Nested", "Magic?", "Wipe gen1a", "Retour"];
 
 fn draw_attack_menu<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
 where
@@ -734,7 +734,30 @@ where
                     pn532.re_select();
                     draw_attack_menu(display, sel)?;
                 }
-                4 | _ => break,
+                4 => {
+                    // Wipe gen1a : efface tous les blocs via backdoor 0x40 sans auth.
+                    draw_nfc_status(display, "Wipe gen1a\nApproche magic...")?;
+                    if !pn532.re_select() {
+                        draw_nfc_status(display, "Carte absente")?;
+                        FreeRtos::delay_ms(2000);
+                        draw_attack_menu(display, sel)?;
+                        continue;
+                    }
+                    let mut last_blk = 0u8;
+                    let (written, total) = pn532.wipe_gen1a(|blk, _status| {
+                        last_blk = blk;
+                    });
+                    let msg = if written == total {
+                        format!("Wipe OK\n{}/{} blocs", written, total)
+                    } else {
+                        format!("Wipe partiel\n{}/{} blocs", written, total)
+                    };
+                    draw_nfc_status(display, &msg)?;
+                    log::info!("wipe_gen1a: {}/{} blocs effacés (dernier={}", written, total, last_blk);
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                5 | _ => break,
             }
         }
         FreeRtos::delay_ms(20);
