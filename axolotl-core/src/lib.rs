@@ -5,6 +5,7 @@
 
 pub mod acl;
 pub mod card;
+pub mod crypto1;
 pub mod diff;
 pub mod dump;
 pub mod keys;
