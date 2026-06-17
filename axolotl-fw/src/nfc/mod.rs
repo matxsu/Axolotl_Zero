@@ -827,6 +827,74 @@ impl<'d> Pn532<'d> {
         is_magic
     }
 
+    /// Wipe gen1a : efface tous les blocs via le backdoor 0x40 sans auth.
+    ///
+    /// Séquence : 0x40 → ACK 0x0A, 0x43 → ACK 0x0A, puis WRITE (0xA0)
+    /// bloc par bloc via InCommunicateThru (CRC-A appended par le CIU).
+    /// Trailers → transport state : `FF FF FF FF FF FF FF 07 80 69 FF FF FF FF FF FF`
+    /// Blocs data → 16 zéros (sauf bloc 0 conservé tel quel pour ne pas bricker l'UID).
+    ///
+    /// Retourne (blocs_effacés, blocs_total).
+    pub fn wipe_gen1a<F: FnMut(u8, u8)>(&mut self, mut on_block: F) -> (u8, u8) {
+        // Ouvre le backdoor
+        let unlock1 = self.in_communicate_thru_relaxed(&[0x40]);
+        let ok1 = matches!(unlock1, Ok((_, ref d)) if d.first() == Some(&0x0A));
+        if !ok1 {
+            log::warn!("wipe_gen1a: 0x40 ACK manquant, abandon");
+            self.reset_field();
+            return (0, 63);
+        }
+        let unlock2 = self.in_communicate_thru_relaxed(&[0x43]);
+        let ok2 = matches!(unlock2, Ok((_, ref d)) if d.first() == Some(&0x0A));
+        if !ok2 {
+            log::warn!("wipe_gen1a: 0x43 ACK manquant, abandon");
+            self.reset_field();
+            return (0, 63);
+        }
+        log::info!("wipe_gen1a: backdoor ouvert");
+
+        const TRANSPORT_TRAILER: [u8; 16] = [
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyA
+            0xFF, 0x07, 0x80, 0x69,             // Access bits transport
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyB
+        ];
+        const ZERO_BLOCK: [u8; 16] = [0u8; 16];
+
+        let mut written = 0u8;
+        // Blocs 1..63 (bloc 0 = UID, on ne touche pas)
+        for blk in 1u8..64 {
+            let sector = blk / 4;
+            let is_trailer = (blk % 4) == 3;
+            let data = if is_trailer { &TRANSPORT_TRAILER } else { &ZERO_BLOCK };
+
+            // WRITE : 0xA0 + bloc, puis 16 bytes data
+            // Le CIU ajoute CRC-A automatiquement sur chaque trame.
+            let cmd_write = [0xA0u8, blk];
+            let ack1 = self.in_communicate_thru_relaxed(&cmd_write);
+            let step1_ok = matches!(ack1, Ok((_, ref d)) if d.first() == Some(&0x0A));
+            if !step1_ok {
+                log::warn!("wipe blk{}: WRITE cmd ACK raté", blk);
+                on_block(blk, 0xFF);
+                continue;
+            }
+            let ack2 = self.in_communicate_thru_relaxed(data);
+            let step2_ok = matches!(ack2, Ok((_, ref d)) if d.first() == Some(&0x0A));
+            if step2_ok {
+                written += 1;
+                log::info!("wipe blk{}: OK", blk);
+                on_block(blk, 0x00);
+            } else {
+                log::warn!("wipe blk{}: data ACK raté", blk);
+                on_block(blk, 0xFF);
+            }
+        }
+
+        // Reset PN532 propre après backdoor
+        self.reset_field();
+        log::info!("wipe_gen1a: {}/63 blocs effacés", written);
+        (written, 63)
+    }
+
     // ── API publique — Ultralight / NTAG ─────────────────────────────────
 
     /// Lit une seule page (4 bytes) Ultralight/NTAG via la commande READ.
