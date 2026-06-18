@@ -1,6 +1,6 @@
 # Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
 # You might have to increase this further if you allocate large stack variables in the main task
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=24576
 
 # Increase a bit these stack sizes as they are also a bit too small by default
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
@@ -10,3 +10,19 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 # that allocate large stack variables; or better yet - use 
 # `std::thread::Builder::new().stack_size(XXX)` for spawning
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+# SD card FAT filesystem
+CONFIG_FATFS_USE_FASTSEEK=y
+CONFIG_FATFS_LONG_FILENAMES=2
+CONFIG_FATFS_MAX_LFN=255
+
+# SD SPI
+CONFIG_SPI_MASTER_ISR_IN_IRAM=y
+
+# Custom partition table (partitions.csv)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# FAT on internal flash (wear-levelling)
+CONFIG_WL_SECTOR_SIZE=4096
+CONFIG_FATFS_VFS_FSTAT_BLKSIZE=512

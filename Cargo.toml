@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "axolotl-fw",
+    "axolotl-core",
+]
+resolver = "2"
+
+# Pour `cargo test` au niveau workspace : on ne touche que axolotl-core,
+# car axolotl-fw nécessite un toolchain xtensa (cd axolotl-fw pour le builder).
+default-members = ["axolotl-core"]
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[patch.crates-io]
+esp-idf-sys = { git = "https://github.com/esp-rs/esp-idf-sys.git" }
+esp-idf-hal = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
+esp-idf-svc = { git = "https://github.com/esp-rs/esp-idf-svc.git" }
