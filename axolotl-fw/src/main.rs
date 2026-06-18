@@ -6,28 +6,34 @@ use embedded_graphics::{
     },
     pixelcolor::{raw::RawU16, Rgb565},
     prelude::*,
-    primitives::{Rectangle, PrimitiveStyleBuilder},
+    primitives::{PrimitiveStyleBuilder, Rectangle},
     text::{Alignment, Text, TextStyleBuilder},
 };
 use esp_idf_hal::{
     delay::FreeRtos,
     gpio::{PinDriver, Pull},
+    i2c::{I2cConfig, I2cDriver},
+    ledc::{config::TimerConfig, LedcDriver, LedcTimerDriver},
     spi::{
         config::{Config, MODE_3},
-        SpiDeviceDriver, SpiDriver, SpiDriverConfig,
+        Dma, SpiDeviceDriver, SpiDriver, SpiDriverConfig,
     },
     units::FromValueType,
 };
+use storage::SdWrite;
 use esp_idf_svc::sys::link_patches;
 use mipidsi::{models::ST7789, Builder};
 
 mod logo;
+mod nfc;
+mod storage;
 
-const BG:     Rgb565 = Rgb565::new(1, 4, 2);
+const BG: Rgb565 = Rgb565::new(1, 4, 2);
 const ORANGE: Rgb565 = Rgb565::new(31, 35, 0);
-const WHITE:  Rgb565 = Rgb565::WHITE;
-const GRAY:   Rgb565 = Rgb565::new(9, 22, 13);
-const BLACK:  Rgb565 = Rgb565::BLACK;
+const WHITE: Rgb565 = Rgb565::WHITE;
+const GRAY: Rgb565 = Rgb565::new(9, 22, 13);
+const BLACK: Rgb565 = Rgb565::BLACK;
+const GREEN: Rgb565 = Rgb565::new(0, 40, 0);
 
 const MENU_ITEMS: &[&str] = &[
     "NFC / RFID",
@@ -37,6 +43,17 @@ const MENU_ITEMS: &[&str] = &[
     "Settings",
 ];
 
+/// Cache des derniers dumps en RAM — permet de re-cloner après être revenu
+/// au menu sans re-scanner la carte source. Reset à chaque reboot.
+#[derive(Default)]
+struct LastDumps {
+    classic: Option<Box<nfc::MifareDump>>,
+    /// Clés trouvées au dump — nécessaires pour reconstruire les trailers au clone
+    /// (le dump renvoie KeyA masqué à 00).
+    classic_keys: Vec<nfc::attacks::SectorKey>,
+    ultralight: Option<Vec<u8>>,
+}
+
 fn item_y(i: usize) -> i32 {
     45 + (i as i32 * 36)
 }
@@ -44,30 +61,84 @@ fn item_y(i: usize) -> i32 {
 fn main() -> anyhow::Result<()> {
     link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    // Le main task IDF a un stack par défaut trop petit pour la chaîne de
+    // types génériques mipidsi + SPI + embedded-graphics.
+    // On délègue tout à un thread Rust avec 64 KB de stack.
+    std::thread::Builder::new()
+        .stack_size(65536)
+        .spawn(run_app)?
+        .join()
+        .map_err(|_| anyhow::anyhow!("app thread panic"))?
+}
+
+fn run_app() -> anyhow::Result<()> {
     log::info!("Axolotl Zero — booting...");
 
     let peripherals = esp_idf_hal::peripherals::Peripherals::take()?;
 
-    let spi = SpiDriver::new(
+    // ── SPI2 (partagé display + SD card) ─────────────────────────────────
+    // MOSI=11  SCK=12  MISO=13
+    // spi_driver déclaré en premier : dropé en dernier (après tous ses emprunteurs).
+
+    // DMA::Auto(4096) obligatoire : SD card transfère des blocs de 512 bytes,
+    // impossible sans DMA (FIFO SPI limité à 64 bytes sans DMA).
+    let spi_driver = SpiDriver::new(
         peripherals.spi2,
         peripherals.pins.gpio12,
-        peripherals.pins.gpio11, 
-        None::<esp_idf_hal::gpio::AnyIOPin>,
-        &SpiDriverConfig::new(),
+        peripherals.pins.gpio11,
+        Some(peripherals.pins.gpio13),
+        &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
 
+    // Pull-up interne ~45 kΩ sur MISO (GPIO13) APRÈS spi_bus_initialize()
+    // car l'init SPI reconfigure les pads GPIO et peut effacer les pull-ups.
+    // Remplacer par un 10 kΩ externe sur le PCB pour une solution robuste.
+    unsafe { esp_idf_svc::sys::gpio_pullup_en(13) };
+
+    // ── SD card : CS=6 — initialisée EN PREMIER sur le bus (mode neutre) ──
+    // Si la SD s'initialise après le display (MODE_3), le bus SPI reste en
+    // MODE_3 et la SD (MODE_0) ne répond plus à ACMD41.
+    let sd: Option<storage::SdStorage<'_, &SpiDriver<'_>>> =
+        match storage::SdStorage::new(&spi_driver, peripherals.pins.gpio6.into()) {
+            Ok(s) => {
+                log::info!("SD: prete");
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!("SD init: {:?} — fonctionnement sans SD", e);
+                None
+            }
+        };
+
+    // ── Flash interne FAT (fallback persistence quand SD absente) ─────────
+    let internal_fs: Option<storage::InternalFs> = match storage::InternalFs::new() {
+        Ok(fs) => Some(fs),
+        Err(e) => {
+            log::warn!("Flash interne: {:?} — persistence desactivee", e);
+            None
+        }
+    };
+
+    // ── Display : CS=8, MODE_3, 40 MHz (après SD pour éviter conflits mode) ──
     let spi_device = SpiDeviceDriver::new(
-        spi,
+        &spi_driver,
         Some(peripherals.pins.gpio8),
         &Config::new()
-            .baudrate(40_000_000_u32.Hz()) 
+            .baudrate(40_000_000_u32.Hz())
             .data_mode(MODE_3),
     )?;
-
-    let dc  = PinDriver::output(peripherals.pins.gpio9)?;
+    let dc = PinDriver::output(peripherals.pins.gpio9)?;
     let rst = PinDriver::output(peripherals.pins.gpio10)?;
-    let mut blk = PinDriver::output(peripherals.pins.gpio46)?;
-    blk.set_high()?;
+    let ledc_timer = LedcTimerDriver::new(
+        peripherals.ledc.timer0,
+        &TimerConfig::new().frequency(1000_u32.Hz()),
+    )?;
+    let mut backlight = LedcDriver::new(
+        peripherals.ledc.channel0,
+        ledc_timer,
+        peripherals.pins.gpio46,
+    )?;
+    backlight.set_duty(backlight.get_max_duty())?;
 
     let di = SPIInterface::new(spi_device, dc);
     let mut display = Builder::new(ST7789, di)
@@ -77,57 +148,99 @@ fn main() -> anyhow::Result<()> {
         .init(&mut FreeRtos)
         .map_err(|e| anyhow::anyhow!("Display init: {:?}", e))?;
 
+    // ── I2C + PN532 ───────────────────────────────────────────────────────
+    let i2c = I2cDriver::new(
+        peripherals.i2c0,
+        peripherals.pins.gpio3,
+        peripherals.pins.gpio4,
+        &I2cConfig::new().baudrate(100_000_u32.Hz()),
+    )?;
+    let mut pn532 = nfc::Pn532::new(i2c)?;
+
+    // ── Joystick ──────────────────────────────────────────────────────────
     let btn_up  = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;
     let btn_dwn = PinDriver::input(peripherals.pins.gpio16, Pull::Up)?;
     let btn_lft = PinDriver::input(peripherals.pins.gpio17, Pull::Up)?;
     let btn_rht = PinDriver::input(peripherals.pins.gpio18, Pull::Up)?;
-    let btn_mid = PinDriver::input(peripherals.pins.gpio21, Pull::Up)?;
+    // GPIO21 tiré à LOW en permanence (LED RGB interne ou court-circuit module) → GPIO14
+    let btn_mid = PinDriver::input(peripherals.pins.gpio14, Pull::Up)?;
 
+    // ── Splash ────────────────────────────────────────────────────────────
     display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
     let logo_w = logo::LOGO_WIDTH as usize;
     let logo_h = logo::LOGO_HEIGHT as usize;
-    
     let target_w = (logo_w * 2) as u16;
     let target_h = (logo_h * 2) as u16;
-
     let pixel_iter = (0..target_h).flat_map(|y| {
-        let logo_w_fixed = logo_w;
+        let lw = logo_w;
         (0..target_w).map(move |x| {
-            let lx = (x / 2) as usize;
-            let ly = (y / 2) as usize;
-            let idx = ly * logo_w_fixed + lx;
-            let color_raw = logo::LOGO_DATA.get(idx).copied().unwrap_or(0x0000);
-            Rgb565::from(RawU16::new(color_raw))
+            let idx = (y / 2) as usize * lw + (x / 2) as usize;
+            Rgb565::from(RawU16::new(logo::LOGO_DATA.get(idx).copied().unwrap_or(0)))
         })
     });
-
-    display.set_pixels(0, 0, target_w - 1, target_h - 1, pixel_iter)
-        .map_err(|e| anyhow::anyhow!("Splash draw error: {:?}", e))?;
-
+    display
+        .set_pixels(0, 0, target_w - 1, target_h - 1, pixel_iter)
+        .map_err(|e| anyhow::anyhow!("Splash: {:?}", e))?;
     log::info!("Splash OK ({}x{})", target_w, target_h);
     FreeRtos::delay_ms(1000);
 
+    // ── Menu ──────────────────────────────────────────────────────────────
     let mut selected: usize = 0;
+    let mut last_dumps = LastDumps::default();
+    let mut clock_shown = false;
+    let mut clock_last_s: u64 = u64::MAX;
+    let mut last_input_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     draw_menu_full(&mut display, selected)?;
 
+    // Front descendant pour MID : ne déclenche que sur transition HIGH→LOW.
+    let mut mid_prev_low = btn_mid.is_low();
     loop {
-        if btn_up.is_low() {
-            let prev = selected;
-            selected = if selected == 0 { MENU_ITEMS.len() - 1 } else { selected - 1 };
-            draw_menu_item(&mut display, prev, false)?;
-            draw_menu_item(&mut display, selected, true)?;
-            while btn_up.is_low() { FreeRtos::delay_ms(10); }
+        let now_us: i64 = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        let any_pressed = btn_up.is_low()
+            || btn_dwn.is_low()
+            || btn_lft.is_low()
+            || btn_rht.is_low()
+            || btn_mid.is_low();
+        if any_pressed {
+            if clock_shown {
+                clock_shown = false;
+                clock_last_s = u64::MAX;
+                draw_menu_full(&mut display, selected)?;
+            }
+            last_input_us = now_us;
+        } else if !clock_shown && (now_us - last_input_us) > 30_000_000 {
+            clock_shown = true;
+        }
+        if clock_shown && !any_pressed {
+            let s = now_us as u64 / 1_000_000;
+            if s != clock_last_s {
+                clock_last_s = s;
+                draw_idle_clock(&mut display)?;
+            }
         }
 
+        if btn_up.is_low() {
+            let prev = selected;
+            selected = if selected == 0 {
+                MENU_ITEMS.len() - 1
+            } else {
+                selected - 1
+            };
+            draw_menu_item(&mut display, prev, false)?;
+            draw_menu_item(&mut display, selected, true)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
         if btn_dwn.is_low() {
             let prev = selected;
             selected = (selected + 1) % MENU_ITEMS.len();
             draw_menu_item(&mut display, prev, false)?;
             draw_menu_item(&mut display, selected, true)?;
-            while btn_dwn.is_low() { FreeRtos::delay_ms(10); }
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
         }
-
         if btn_lft.is_low() {
             if selected != 0 {
                 let prev = selected;
@@ -135,9 +248,10 @@ fn main() -> anyhow::Result<()> {
                 draw_menu_item(&mut display, prev, false)?;
                 draw_menu_item(&mut display, selected, true)?;
             }
-            while btn_lft.is_low() { FreeRtos::delay_ms(10); }
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
         }
-
         if btn_rht.is_low() {
             if selected != MENU_ITEMS.len() - 1 {
                 let prev = selected;
@@ -145,42 +259,2378 @@ fn main() -> anyhow::Result<()> {
                 draw_menu_item(&mut display, prev, false)?;
                 draw_menu_item(&mut display, selected, true)?;
             }
-            while btn_rht.is_low() { FreeRtos::delay_ms(10); }
+            while btn_rht.is_low() {
+                FreeRtos::delay_ms(10);
+            }
         }
+        let mid_cur_low = btn_mid.is_low();
+        let mid_edge = mid_cur_low && !mid_prev_low;
+        mid_prev_low = mid_cur_low;
+        if mid_edge {
+            // attend le relâchement, timeout 500ms au cas où bouton coincé
+            let mut t = 0u32;
+            while btn_mid.is_low() && t < 50 { FreeRtos::delay_ms(10); t += 1; }
+            let storage: Option<&dyn SdWrite> = sd
+                .as_ref()
+                .map(|s| s as &dyn SdWrite)
+                .or_else(|| internal_fs.as_ref().map(|f| f as &dyn SdWrite));
 
-        if btn_mid.is_low() {
-            while btn_mid.is_low() { FreeRtos::delay_ms(10); }
-            draw_selected(&mut display, selected)?;
-            loop {
-                if btn_mid.is_low() || btn_up.is_low() || btn_dwn.is_low() || btn_lft.is_low() || btn_rht.is_low() { 
-                    break; 
+            match selected {
+                0 => run_nfc_scan(
+                    &mut display,
+                    &mut pn532,
+                    storage,
+                    &mut last_dumps,
+                    &btn_mid,
+                    &btn_lft,
+                    &btn_up,
+                    &btn_dwn,
+                    &btn_rht,
+                )?,
+                3 => run_storage_info(
+                    &mut display,
+                    storage,
+                    &btn_mid,
+                    &btn_lft,
+                )?,
+                4 => run_settings(
+                    &mut display,
+                    &mut backlight,
+                    &btn_up,
+                    &btn_dwn,
+                    &btn_mid,
+                    &btn_lft,
+                )?,
+                _ => {
+                    draw_selected(&mut display, selected)?;
+                    loop {
+                        if btn_mid.is_low()
+                            || btn_up.is_low()
+                            || btn_dwn.is_low()
+                            || btn_lft.is_low()
+                            || btn_rht.is_low()
+                        {
+                            break;
+                        }
+                        FreeRtos::delay_ms(20);
+                    }
                 }
-                FreeRtos::delay_ms(20);
             }
             draw_menu_full(&mut display, selected)?;
-            while btn_mid.is_low() || btn_up.is_low() || btn_dwn.is_low() { FreeRtos::delay_ms(10); }
+            let mut t = 0u32;
+            while (btn_mid.is_low() || btn_up.is_low() || btn_dwn.is_low()) && t < 100 {
+                FreeRtos::delay_ms(10); t += 1;
+            }
         }
-
         FreeRtos::delay_ms(20);
     }
 }
 
-fn draw_menu_full<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
-where D: DrawTarget<Color = Rgb565>, D::Error: core::fmt::Debug,
+// ── NFC scan ───────────────────────────────────────────────────────────────
+
+fn run_nfc_scan<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    sd: Option<&dyn SdWrite>,
+    last_dumps: &mut LastDumps,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_rht: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+    loop {
+        if btn_lft.is_low() {
+            break;
+        }
+        // RIGHT = menu des dumps sauvegardés (sélection → clone, sans re-scan)
+        if btn_rht.is_low() {
+            while btn_rht.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_saved_dumps(display, pn532, sd, btn_up, btn_dwn, btn_mid, btn_lft)?;
+            draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            continue;
+        }
+        // UP = re-clone du dernier dump en RAM (classic en priorité)
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if let Some(dump) = last_dumps.classic.as_ref() {
+                run_nfc_clone(display, pn532, dump, &last_dumps.classic_keys, btn_lft)?;
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            } else if let Some(data) = last_dumps.ultralight.as_ref() {
+                // .clone() pour libérer last_dumps qui est emprunté
+                let data_owned = data.clone();
+                run_nfc_ultralight_clone(display, pn532, &data_owned, btn_lft)?;
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            } else {
+                draw_nfc_status(display, "Aucun dump en RAM")?;
+                FreeRtos::delay_ms(1500);
+                draw_nfc_screen_with_cache(
+                    display,
+                    None,
+                    None,
+                    last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+                )?;
+            }
+            continue;
+        }
+        // DOWN = browse blocs du dernier dump en RAM (classic ou UL)
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if let Some(dump) = last_dumps.classic.as_ref() {
+                run_view_dump(display, dump, btn_up, btn_dwn, btn_lft)?;
+            } else if let Some(data) = last_dumps.ultralight.as_ref() {
+                let data_owned = data.clone();
+                run_view_ul_dump(display, &data_owned, btn_up, btn_dwn, btn_lft)?;
+            } else {
+                draw_nfc_status(display, "Aucun dump en RAM")?;
+                FreeRtos::delay_ms(1500);
+            }
+            draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            continue;
+        }
+        match pn532.read_uid() {
+            Ok(Some(uid)) => {
+                let hex = uid.to_hex();
+                let ctype = uid.card_type();
+                log::info!(
+                    "NFC UID: {} SAK={:#04x} ATQA={:02X}{:02X} -> {}",
+                    hex.as_str(),
+                    uid.sak,
+                    uid.atqa[1],
+                    uid.atqa[0],
+                    ctype
+                );
+                draw_nfc_screen(display, Some(&hex), Some(ctype))?;
+
+                let mut waited = 0u32;
+                loop {
+                    if btn_lft.is_low() {
+                        break;
+                    }
+                    if btn_mid.is_low() {
+                        while btn_mid.is_low() {
+                            FreeRtos::delay_ms(10);
+                        }
+
+                        if uid.is_mifare_classic() {
+                            run_nfc_dump_classic(
+                                display, pn532, &uid, &hex, sd, last_dumps,
+                                btn_mid, btn_lft, btn_up, btn_dwn,
+                            )?;
+                        } else if uid.is_ultralight() {
+                            run_nfc_ultralight(
+                                display, pn532, &hex, sd, last_dumps,
+                                btn_mid, btn_lft,
+                            )?;
+                        } else {
+                            draw_nfc_status(display, "Type non supporte")?;
+                            FreeRtos::delay_ms(2000);
+                        }
+
+                        draw_nfc_screen(display, Some(&hex), Some(ctype))?;
+                        break;
+                    }
+                    FreeRtos::delay_ms(20);
+                    waited += 20;
+                    if waited > 5000 {
+                        break;
+                    }
+                }
+                // Reset toujours — le PN532 doit revenir en état propre pour le
+                // prochain scan.
+                pn532.reset_field();
+                // LEFT ici signifiait "quitter cette carte", PAS "quitter le NFC".
+                // On consomme l'appui et on retourne au scan : poser une nouvelle
+                // carte la détecte directement. Pour sortir du NFC, ré-appuyer
+                // LEFT sur l'écran d'attente (test en haut de boucle).
+                while btn_lft.is_low() {
+                    FreeRtos::delay_ms(10);
+                }
+                draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Erreur de comm (ex. "PN532 timeout") → re-init de récupération.
+                // Si ce log apparait a chaque scan, reset_field est encore en cause.
+                log::warn!("NFC scan err: {:?} — recover", e);
+                pn532.recover();
+                FreeRtos::delay_ms(200);
+            }
+        }
+        FreeRtos::delay_ms(300);
+    }
+    Ok(())
+}
+
+// ── MIFARE Classic dump + clone ────────────────────────────────────────────
+
+fn run_nfc_dump_classic<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    uid: &nfc::NfcUid,
+    hex: &heapless::String<32>,
+    sd: Option<&dyn SdWrite>,
+    last_dumps: &mut LastDumps,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    match pn532.mifare_dump(uid, |sector, total| {
+        let _ = draw_dump_progress(display, sector, total);
+    }) {
+        Ok((dump, found_keys)) => {
+            nfc::print_dump_log(&dump);
+            let readable_count = dump.readable_count();
+            let total = dump.total_blocks();
+            // Sauvegarde UNIQUEMENT les dumps complets (64/64) : un .mfd partiel
+            // se recharge avec tous les blocs marqués lisibles (from_mfd_bytes)
+            // → les zéros passeraient pour des vraies données au clone.
+            let complete = readable_count == total;
+            if complete {
+                if let Some(sd) = sd.as_ref() {
+                    let uid_str = hex.as_str().replace(':', "");
+                    // .mfd AVEC les clés réinjectées dans les trailers → re-clonable
+                    // depuis le fichier seul (menu RIGHT) sans re-scanner la carte.
+                    match sd.write_file(
+                        &format!("/NFC/dumps/{}.mfd", uid_str),
+                        &nfc::attacks::dump_to_mfd_with_keys(&dump, &found_keys),
+                    ) {
+                        Ok(_) => log::info!("Dump 64/64 sauvegarde : {}.mfd", uid_str),
+                        Err(e) => log::warn!("Sauvegarde .mfd KO: {:?}", e),
+                    }
+                    let mut txt = format!("UID: {}\nType: {:?}\n\n", hex.as_str(), dump.card_type);
+                    for block in 0..total {
+                        let d = &dump.blocks[block];
+                        txt.push_str(&format!(
+                            "Bloc {:03}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}\n",
+                            block,
+                            d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+                            d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]
+                        ));
+                    }
+                    let _ = sd.write_file(
+                        &format!("/NFC/dumps/{}.txt", uid_str),
+                        txt.as_bytes(),
+                    );
+                }
+            } else {
+                log::info!(
+                    "Dump partiel {}/{} — non sauvegarde (incomplet)",
+                    readable_count, total
+                );
+            }
+            let acl = dump.access_summary();
+            let can_clone = readable_count > 0;
+            draw_post_dump_with_attack(display, readable_count, total, &acl, !can_clone)?;
+            loop {
+                if btn_lft.is_low() {
+                    break;
+                }
+                if can_clone && btn_mid.is_low() {
+                    while btn_mid.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    run_nfc_clone(display, pn532, &dump, &found_keys, btn_lft)?;
+                    break;
+                }
+                // DOWN → sous-menu attaques
+                if btn_dwn.is_low() {
+                    while btn_dwn.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    run_nfc_attacks(display, pn532, uid, &found_keys, btn_up, btn_dwn, btn_mid, btn_lft)?;
+                    draw_post_dump_with_attack(display, readable_count, total, &acl, !can_clone)?;
+                }
+                FreeRtos::delay_ms(20);
+            }
+            last_dumps.classic = Some(dump);
+            last_dumps.classic_keys = found_keys;
+        }
+        Err(e) => {
+            log::warn!("Dump err: {:?}", e);
+            draw_nfc_status(display, "Dump echoue")?;
+            FreeRtos::delay_ms(2000);
+        }
+    }
+    Ok(())
+}
+
+// ── Sous-menu Attaques NFC ─────────────────────────────────────────────────
+
+const ATTACK_ITEMS: &[&str] = &["Probe PRNG", "Darkside", "Nested", "Magic?", "Wipe gen1a", "Retour"];
+
+fn draw_attack_menu<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
 {
     display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    
-    let style = PrimitiveStyleBuilder::new().fill_color(GRAY).build();
-    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
-        .into_styled(style)
-        .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Text::with_text_style(
-        "AXOLOTL ZERO", Point::new(120, 22),
-        MonoTextStyle::new(&FONT_10X20, ORANGE), centered,
+        "NFC ATTACK",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
     ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
+    for (i, label) in ATTACK_ITEMS.iter().enumerate() {
+        let y = 40 + i as i32 * 48;
+        let (bg, fg) = if i == selected { (ORANGE, BLACK) } else { (BG, WHITE) };
+        Rectangle::new(Point::new(10, y), Size::new(220, 38))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
+            .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(
+            label,
+            Point::new(20, y + 26),
+            MonoTextStyle::new(&FONT_10X20, fg),
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+fn run_nfc_attacks<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    uid: &nfc::NfcUid,
+    found_keys: &[nfc::attacks::SectorKey],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let mut sel = 0usize;
+    draw_attack_menu(display, sel)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() { FreeRtos::delay_ms(10); }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() { FreeRtos::delay_ms(10); }
+            if sel > 0 { sel -= 1; }
+            draw_attack_menu(display, sel)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() { FreeRtos::delay_ms(10); }
+            if sel < ATTACK_ITEMS.len() - 1 { sel += 1; }
+            draw_attack_menu(display, sel)?;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() { FreeRtos::delay_ms(10); }
+            match sel {
+                0 => {
+                    draw_nfc_status(display, "Probe PRNG...")?;
+                    let probe = pn532.darkside_probe(uid);
+                    let summary = match &probe.prng {
+                        nfc::darkside::PrngType::Fixed(nt) => {
+                            format!("PRNG FIXE\nNT={:08X}\nDarkside OK!", nt)
+                        }
+                        nfc::darkside::PrngType::WeakLfsr { .. } => {
+                            "PRNG FAIBLE\nNested possible".to_string()
+                        }
+                        nfc::darkside::PrngType::Strong => {
+                            "PRNG FORT\nProxmark3 requis".to_string()
+                        }
+                    };
+                    draw_nfc_status(display, &summary)?;
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                1 => {
+                    draw_nfc_status(display, "Probe PRNG d'abord...")?;
+                    let probe = pn532.darkside_probe(uid);
+                    if let nfc::darkside::PrngType::Fixed(nt) = probe.prng {
+                        draw_nfc_status(display, "Darkside\nen cours...")?;
+                        let _key = pn532.darkside_attack(uid, nt, |att, tot| {
+                            let msg = format!("DS {}/{}", att, tot);
+                            let _ = draw_nfc_status(display, &msg);
+                        });
+                        draw_nfc_status(display, "Voir moniteur\npour resultats")?;
+                    } else {
+                        draw_nfc_status(display, "PRNG fort\nDarkside impossible")?;
+                    }
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                2 => {
+                    // Nested attack : cherche une KeyA connue + un secteur cible (KeyB only).
+                    let known_a = found_keys.iter().find(|k| k.key_ab == 0);
+                    let target = found_keys.iter().find(|k| {
+                        k.key_ab == 1
+                            && !found_keys.iter().any(|k2| k2.sector == k.sector && k2.key_ab == 0)
+                    });
+                    match (known_a, target) {
+                        (Some(src), Some(tgt)) => {
+                            let msg = format!(
+                                "Nested S{:02}->S{:02}\n20 samples...",
+                                src.sector, tgt.sector
+                            );
+                            draw_nfc_status(display, &msg)?;
+                            let result = pn532.nested_collect(
+                                uid,
+                                src.sector,
+                                src.key,
+                                tgt.sector,
+                                20,
+                            );
+                            let done_msg = if result.found_key.is_some() {
+                                "Cle trouvee!\nVoir moniteur".to_string()
+                            } else {
+                                format!("{} samples OK\nVoir moniteur", result.samples.len())
+                            };
+                            draw_nfc_status(display, &done_msg)?;
+                        }
+                        (None, _) => {
+                            draw_nfc_status(display, "Nested: aucune\nKeyA connue")?;
+                            log::info!("Nested: lancez le dict attack d'abord");
+                        }
+                        (_, None) => {
+                            draw_nfc_status(display, "Nested: tous\nles secteurs OK")?;
+                            log::info!("Nested: pas de secteur cible (toutes les KeyA connues)");
+                        }
+                    }
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                3 => {
+                    // Détection carte magic gen1a — explicitement demandée par l'utilisateur.
+                    draw_nfc_status(display, "Probe magic...\nApproche la carte")?;
+                    // Re-select pour s'assurer que la carte est présente.
+                    if !pn532.re_select() {
+                        draw_nfc_status(display, "Carte absente")?;
+                        FreeRtos::delay_ms(2000);
+                        draw_attack_menu(display, sel)?;
+                        continue;
+                    }
+                    let is_magic = pn532.detect_magic_gen1a();
+                    if is_magic {
+                        draw_nfc_status(display, "MAGIC GEN1A!\nUID-modifiable")?;
+                        log::info!("*** MAGIC GEN1A detectee ***");
+                    } else {
+                        draw_nfc_status(display, "Carte standard\n(non-magic)")?;
+                    }
+                    FreeRtos::delay_ms(3000);
+                    // Re-select pour restaurer l'etat apres la probe.
+                    pn532.re_select();
+                    draw_attack_menu(display, sel)?;
+                }
+                4 => {
+                    // Wipe gen1a : efface tous les blocs via backdoor 0x40 sans auth.
+                    draw_nfc_status(display, "Wipe gen1a\nApproche magic...")?;
+                    if !pn532.re_select() {
+                        draw_nfc_status(display, "Carte absente")?;
+                        FreeRtos::delay_ms(2000);
+                        draw_attack_menu(display, sel)?;
+                        continue;
+                    }
+                    let mut last_blk = 0u8;
+                    let (written, total) = pn532.wipe_gen1a(|blk, _status| {
+                        last_blk = blk;
+                    });
+                    let msg = if written == total {
+                        format!("Wipe OK\n{}/{} blocs", written, total)
+                    } else {
+                        format!("Wipe partiel\n{}/{} blocs", written, total)
+                    };
+                    draw_nfc_status(display, &msg)?;
+                    log::info!("wipe_gen1a: {}/{} blocs effacés (dernier={}", written, total, last_blk);
+                    FreeRtos::delay_ms(3000);
+                    draw_attack_menu(display, sel)?;
+                }
+                5 | _ => break,
+            }
+        }
+        FreeRtos::delay_ms(20);
+    }
+    Ok(())
+}
+
+fn draw_post_dump_with_attack<D>(
+    display: &mut D,
+    readable: usize,
+    total: usize,
+    acl: &axolotl_core::dump::AccessSummary,
+    show_attack_hint: bool,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("{}/{} blocs lus", readable, total);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, if readable > 0 { GREEN } else { GRAY }),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let acl_summary = format!("ACL fact:{} cust:{} corr:{}", acl.factory, acl.custom, acl.corrupt);
+    Text::with_text_style(
+        &acl_summary,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    if show_attack_hint {
+        Text::with_text_style(
+            "Dict echoue — cles inconnues",
+            Point::new(120, 170),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+            centered,
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "DWN: Attaques crypto",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GREEN),
+            centered,
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    } else {
+        Text::with_text_style(
+            "MID: clone  DWN: attack",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+// ── Ultralight / NTAG read ─────────────────────────────────────────────────
+
+fn run_nfc_ultralight<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    hex: &heapless::String<32>,
+    sd: Option<&dyn SdWrite>,
+    last_dumps: &mut LastDumps,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_status(display, "Lecture UL/NTAG...")?;
+    let data = match pn532.ntag_read_full() {
+        Ok(d) => d,
+        Err(e) => {
+            log::warn!("UL read err: {:?}", e);
+            draw_nfc_status(display, "Lecture echouee")?;
+            FreeRtos::delay_ms(2000);
+            return Ok(());
+        }
+    };
+
+    let pages = data.len() / 4;
+    log::info!("=== UL/NTAG Dump : {} pages ({} bytes) ===", pages, data.len());
+    for page in 0..pages {
+        let p = &data[page * 4..page * 4 + 4];
+        log::info!(
+            "Page {:03}: {:02X} {:02X} {:02X} {:02X}",
+            page,
+            p[0],
+            p[1],
+            p[2],
+            p[3]
+        );
+    }
+
+    if let Some(sd) = sd.as_ref() {
+        let uid_str = hex.as_str().replace(':', "");
+        let _ = sd.write_file(&format!("/NFC/dumps/{}.bin", uid_str), &data);
+        let mut txt = format!(
+            "UID: {}\nType: Ultralight/NTAG ({} pages, {} bytes)\n\n",
+            hex.as_str(),
+            pages,
+            data.len()
+        );
+        for page in 0..pages {
+            let p = &data[page * 4..page * 4 + 4];
+            txt.push_str(&format!(
+                "Page {:03}: {:02X} {:02X} {:02X} {:02X}\n",
+                page, p[0], p[1], p[2], p[3]
+            ));
+        }
+        let _ = sd.write_file(&format!("/NFC/dumps/{}.txt", uid_str), txt.as_bytes());
+    }
+
+    draw_post_ul_dump(display, pages)?;
+
+    // Boucle MID=clone / LFT=retour
+    loop {
+        if btn_lft.is_low() {
+            break;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_nfc_ultralight_clone(display, pn532, &data, btn_lft)?;
+            break;
+        }
+        FreeRtos::delay_ms(20);
+    }
+
+    last_dumps.ultralight = Some(data);
+    Ok(())
+}
+
+// ── Ultralight clone (écriture vers carte cible UL/NTAG) ──────────────────
+
+fn run_nfc_ultralight_clone<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    data: &[u8],
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_status(display, "Approche UL/NTAG cible...")?;
+
+    let mut target = None;
+    for _ in 0..150u32 {
+        if btn_lft.is_low() {
+            return Ok(());
+        }
+        if let Ok(Some(u)) = pn532.read_uid() {
+            if u.is_ultralight() {
+                target = Some(u);
+                break;
+            }
+            draw_nfc_status(display, "Pas une UL/NTAG")?;
+            FreeRtos::delay_ms(1000);
+            draw_nfc_status(display, "Approche UL/NTAG cible...")?;
+        }
+        FreeRtos::delay_ms(200);
+    }
+
+    if target.is_none() {
+        draw_nfc_status(display, "Timeout - pas de carte")?;
+        FreeRtos::delay_ms(2000);
+        return Ok(());
+    }
+
+    match pn532.ultralight_clone(data, |page, total| {
+        let _ = draw_dump_progress(display, page, total);
+    }) {
+        Ok(n) => {
+            let msg = format!("{} pages ecrites!", n);
+            draw_nfc_status(display, &msg)?;
+        }
+        Err(e) => {
+            log::warn!("UL clone err: {:?}", e);
+            draw_nfc_status(display, "Clone UL echoue")?;
+        }
+    }
+    FreeRtos::delay_ms(2000);
+    Ok(())
+}
+
+// ── NFC clone ──────────────────────────────────────────────────────────────
+
+fn run_nfc_clone<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    dump: &nfc::MifareDump,
+    keys: &[nfc::attacks::SectorKey],
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_status(display, "Approche carte magic\n(gen2/CUID)...")?;
+
+    // Attente de la carte cible — 30s timeout
+    let mut found = false;
+    for _ in 0..150u32 {
+        if btn_lft.is_low() {
+            return Ok(());
+        }
+        if let Ok(Some(u)) = pn532.read_uid() {
+            if u.is_mifare_classic() {
+                found = true;
+                break;
+            }
+            draw_nfc_status(display, "Pas une MIFARE Classic")?;
+            FreeRtos::delay_ms(1000);
+            draw_nfc_status(display, "Approche carte magic\n(gen2/CUID)...")?;
+        }
+        FreeRtos::delay_ms(200);
+    }
+    if !found {
+        draw_nfc_status(display, "Timeout - pas de carte")?;
+        FreeRtos::delay_ms(2000);
+        return Ok(());
+    }
+
+    // Clone réversible (vraie KeyA + access bits transport FF0780).
+    match pn532.clone_to_magic(dump, keys, true, |sector, total| {
+        let _ = draw_dump_progress(display, sector, total);
+    }) {
+        Ok((n, block0)) => {
+            // Read-back : UID réel de la carte clonée.
+            let rb = pn532.read_uid().ok().flatten().map(|u| u.to_hex());
+            let uid_line = rb
+                .as_ref()
+                .map(|h| h.as_str().to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let msg = if block0 {
+                format!("{} blocs ecrits\nUID clone -> {}", n, uid_line)
+            } else {
+                // Pas un échec : un lecteur VIGIK auth par KeyA+data, souvent
+                // sans vérifier l'UID. La porte peut s'ouvrir quand même.
+                format!(
+                    "{} blocs ecrits\nUID non ecrit ({})\n-> teste sur la porte!",
+                    n, uid_line
+                )
+            };
+            draw_nfc_status(display, &msg)?;
+            log::info!("Clone: {} blocs, bloc0={}, UID lu={}", n, block0, uid_line);
+        }
+        Err(e) => {
+            log::warn!("Clone err: {:?}", e);
+            // Garde-fou : cible non-magic → message explicite (rien n'a été
+            // écrit, la carte n'est pas abîmée).
+            let txt = e.to_string();
+            if txt.contains("non-magic") {
+                draw_nfc_status(
+                    display,
+                    "Cible non-magic\nbloc 0 verrouille\nclone annule (rien ecrit)",
+                )?;
+            } else {
+                draw_nfc_status(display, "Clone echoue")?;
+            }
+        }
+    }
+    FreeRtos::delay_ms(4000);
+    Ok(())
+}
+
+// ── Dumps sauvegardés : sélection → clone ────────────────────────────────────
+
+/// Charge un .mfd depuis le stockage : infère le type carte d'après la taille
+/// et reconstruit les clés depuis les trailers (cf. `dump_to_mfd_with_keys`).
+fn load_dump_file(
+    sd: &dyn SdWrite,
+    path: &str,
+) -> Option<(nfc::MifareDump, Vec<nfc::attacks::SectorKey>)> {
+    let data = sd.read_file(path).ok()?;
+    let card_type = match data.len() {
+        320 => nfc::ClassicType::Mini,
+        1024 => nfc::ClassicType::Classic1K,
+        4096 => nfc::ClassicType::Classic4K,
+        _ => return None,
+    };
+    let dump = nfc::MifareDump::from_mfd_bytes(card_type, &data)?;
+    let keys = nfc::attacks::keys_from_dump(&dump);
+    Some((dump, keys))
+}
+
+/// Menu : liste les dumps complets sauvegardés et permet de les cloner sur une
+/// carte magic sans re-scanner la carte source.
+fn run_saved_dumps<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    sd: Option<&dyn SdWrite>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let sd = match sd {
+        Some(s) => s,
+        None => {
+            draw_nfc_status(display, "Pas de stockage")?;
+            FreeRtos::delay_ms(1500);
+            return Ok(());
+        }
+    };
+
+    let mut files: Vec<String> = sd
+        .list_dir("/NFC/dumps")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.ends_with(".mfd"))
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        draw_nfc_status(display, "Aucun dump sauve\n(dump 64/64 requis)")?;
+        FreeRtos::delay_ms(2000);
+        return Ok(());
+    }
+
+    let mut sel = 0usize;
+    draw_dump_list(display, &files, sel)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = if sel == 0 { files.len() - 1 } else { sel - 1 };
+            draw_dump_list(display, &files, sel)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = (sel + 1) % files.len();
+            draw_dump_list(display, &files, sel)?;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            let path = format!("/NFC/dumps/{}", files[sel]);
+            match load_dump_file(sd, &path) {
+                Some((dump, keys)) => {
+                    run_saved_dump_action(
+                        display, pn532, &files[sel], &dump, &keys,
+                        btn_up, btn_dwn, btn_mid, btn_lft,
+                    )?;
+                }
+                None => {
+                    draw_nfc_status(display, "Lecture/format KO")?;
+                    FreeRtos::delay_ms(1500);
+                }
+            }
+            draw_dump_list(display, &files, sel)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+/// Écran d'action sur un dump sélectionné : MID=cloner, DOWN=voir, LFT=retour.
+fn run_saved_dump_action<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    name: &str,
+    dump: &nfc::MifareDump,
+    keys: &[nfc::attacks::SectorKey],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_saved_dump_info(display, name, dump, keys.len())?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_nfc_clone(display, pn532, dump, keys, btn_lft)?;
+            draw_saved_dump_info(display, name, dump, keys.len())?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_view_dump(display, dump, btn_up, btn_dwn, btn_lft)?;
+            draw_saved_dump_info(display, name, dump, keys.len())?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn draw_dump_list<D>(display: &mut D, files: &[String], sel: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "DUMPS SAUVES",
+        Point::new(120, 28),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    // Fenêtre glissante de 7 entrées autour de la sélection.
+    const VISIBLE: usize = 7;
+    let start = if sel >= VISIBLE { sel - VISIBLE + 1 } else { 0 };
+    for (row, idx) in (start..files.len().min(start + VISIBLE)).enumerate() {
+        let y = 60 + row as i32 * 22;
+        let stem = files[idx].strip_suffix(".mfd").unwrap_or(&files[idx]);
+        let (prefix, color) = if idx == sel {
+            ("> ", GREEN)
+        } else {
+            ("  ", GRAY)
+        };
+        let line = format!("{}{}", prefix, stem);
+        Text::with_text_style(
+            &line,
+            Point::new(120, y),
+            MonoTextStyle::new(&FONT_10X20, color),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    Text::with_text_style(
+        "MID:ouvrir  UP/DN:nav  LFT:retour",
+        Point::new(120, 228),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Ok(())
+}
+
+fn draw_saved_dump_info<D>(
+    display: &mut D,
+    name: &str,
+    dump: &nfc::MifareDump,
+    key_count: usize,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "DUMP",
+        Point::new(120, 30),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let stem = name.strip_suffix(".mfd").unwrap_or(name);
+    Text::with_text_style(
+        stem,
+        Point::new(120, 70),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let info = format!(
+        "{:?}  {} blocs",
+        dump.card_type,
+        dump.total_blocks()
+    );
+    Text::with_text_style(
+        &info,
+        Point::new(120, 105),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let keys_line = format!("{} cles dispo", key_count);
+    Text::with_text_style(
+        &keys_line,
+        Point::new(120, 130),
+        MonoTextStyle::new(&FONT_6X10, if key_count > 0 { GREEN } else { GRAY }),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID: cloner (carte magic)",
+        Point::new(120, 185),
+        MonoTextStyle::new(&FONT_6X10, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "DOWN: voir blocs",
+        Point::new(120, 205),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 225),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Ok(())
+}
+
+// ── Storage info ───────────────────────────────────────────────────────────
+
+// ── Dump browser (view blocks on screen) ───────────────────────────────────
+
+fn run_view_dump<D>(
+    display: &mut D,
+    dump: &nfc::MifareDump,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let total = dump.total_blocks();
+    if total == 0 {
+        return Ok(());
+    }
+    let mut current = 0usize;
+    draw_dump_block(display, dump, current)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = if current == 0 { total - 1 } else { current - 1 };
+            draw_dump_block(display, dump, current)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = (current + 1) % total;
+            draw_dump_block(display, dump, current)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn run_view_ul_dump<D>(
+    display: &mut D,
+    data: &[u8],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let total = data.len() / 4;
+    if total == 0 {
+        return Ok(());
+    }
+    let mut current = 0usize;
+    draw_ul_page(display, data, current, total)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = if current == 0 { total - 1 } else { current - 1 };
+            draw_ul_page(display, data, current, total)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            current = (current + 1) % total;
+            draw_ul_page(display, data, current, total)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn draw_ul_page<D>(
+    display: &mut D,
+    data: &[u8],
+    page: usize,
+    total: usize,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "UL/NTAG VIEWER",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let title = format!("Page {:03} / {:03}", page, total - 1);
+    Text::with_text_style(
+        &title,
+        Point::new(120, 55),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let off = page * 4;
+    let d = &data[off..off + 4];
+    let hex = format!("{:02X} {:02X} {:02X} {:02X}", d[0], d[1], d[2], d[3]);
+    Text::with_text_style(
+        &hex,
+        Point::new(120, 110),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let mut ascii = String::with_capacity(4);
+    for &b in d.iter() {
+        ascii.push(if (0x20..0x7F).contains(&b) {
+            b as char
+        } else {
+            '.'
+        });
+    }
+    Text::with_text_style(
+        &ascii,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "UP/DOWN: navigate",
+        Point::new(120, 200),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn draw_dump_block<D>(
+    display: &mut D,
+    dump: &nfc::MifareDump,
+    block: usize,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "DUMP VIEWER",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let title = format!("Bloc {:03} / {:03}", block, dump.total_blocks() - 1);
+    Text::with_text_style(
+        &title,
+        Point::new(120, 55),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    if !dump.readable[block] {
+        Text::with_text_style(
+            "<non lisible>",
+            Point::new(120, 120),
+            MonoTextStyle::new(&FONT_10X20, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    } else {
+        let d = &dump.blocks[block];
+        let line1 = format!(
+            "{:02X} {:02X} {:02X} {:02X}  {:02X} {:02X} {:02X} {:02X}",
+            d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+        );
+        let line2 = format!(
+            "{:02X} {:02X} {:02X} {:02X}  {:02X} {:02X} {:02X} {:02X}",
+            d[8], d[9], d[10], d[11], d[12], d[13], d[14], d[15]
+        );
+        Text::with_text_style(
+            &line1,
+            Point::new(120, 100),
+            MonoTextStyle::new(&FONT_6X10, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            &line2,
+            Point::new(120, 120),
+            MonoTextStyle::new(&FONT_6X10, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        // Représentation ASCII (caractères imprimables uniquement)
+        let mut ascii = String::with_capacity(16);
+        for &b in d.iter() {
+            ascii.push(if (0x20..0x7F).contains(&b) {
+                b as char
+            } else {
+                '.'
+            });
+        }
+        Text::with_text_style(
+            &ascii,
+            Point::new(120, 150),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    Text::with_text_style(
+        "UP/DOWN: navigate",
+        Point::new(120, 200),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn run_storage_info<D>(
+    display: &mut D,
+    sd: Option<&dyn SdWrite>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Text::with_text_style(
+        "Storage",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let status = if sd.is_some() { "SD card: OK" } else { "SD card: absent" };
+    Text::with_text_style(
+        status,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, if sd.is_some() { GREEN } else { GRAY }),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    if let Some(sd) = sd {
+        if let Ok(files) = sd.list_dir("/NFC/dumps") {
+            let count = format!("{} dump(s)", files.len());
+            Text::with_text_style(
+                &count,
+                Point::new(120, 130),
+                MonoTextStyle::new(&FONT_6X10, WHITE),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+    }
+
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    loop {
+        if btn_mid.is_low() || btn_lft.is_low() {
+            break;
+        }
+        FreeRtos::delay_ms(20);
+    }
+    Ok(())
+}
+
+// ── Idle clock ─────────────────────────────────────────────────────────────
+
+fn draw_idle_clock<D>(display: &mut D) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let h = (ts % 86400) / 3600;
+    let m = (ts % 3600) / 60;
+    let s = ts % 60;
+    let time_str = format!("{:02}:{:02}:{:02}", h, m, s);
+
+    let days_since_epoch = ts / 86400;
+    let (year, month, day) = epoch_days_to_date(days_since_epoch);
+    let date_str = format!("{:02}/{:02}/{}", day, month, year);
+
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        &time_str,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        &date_str,
+        Point::new(120, 130),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "appuie pour revenir",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn epoch_days_to_date(days: u64) -> (u32, u32, u32) {
+    let mut y = 1970u32;
+    let mut d = days as u32;
+    loop {
+        let dy = if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 { 366 } else { 365 };
+        if d < dy {
+            break;
+        }
+        d -= dy;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 1u32;
+    for &md in &mdays {
+        if d < md {
+            break;
+        }
+        d -= md;
+        m += 1;
+    }
+    (y, m, d + 1)
+}
+
+// ── Settings ───────────────────────────────────────────────────────────────
+
+const SETTINGS_ITEMS: &[&str] = &[
+    "Luminosite",
+    "Lampe torche",
+    "Chronometre",
+    "Minuteur",
+    "Redemarrer",
+    "Eteindre",
+    "A propos",
+];
+
+const SETTINGS_VISIBLE: usize = 5;
+
+fn settings_view_y(slot: usize) -> i32 {
+    36 + (slot as i32 * 38)
+}
+
+fn run_settings<D>(
+    display: &mut D,
+    backlight: &mut LedcDriver<'_>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let mut sel = 0usize;
+    let mut view = 0usize;
+    let mut brightness_pct: u8 = 100;
+    let mut torch_on = false;
+    draw_settings_full(display, sel, view, brightness_pct)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            sel = if sel == 0 { SETTINGS_ITEMS.len() - 1 } else { sel - 1 };
+            if sel < view {
+                view = sel;
+            }
+            draw_settings_full(display, sel, view, brightness_pct)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            sel = (sel + 1) % SETTINGS_ITEMS.len();
+            if sel >= view + SETTINGS_VISIBLE {
+                view = sel + 1 - SETTINGS_VISIBLE;
+            }
+            draw_settings_full(display, sel, view, brightness_pct)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            match sel {
+                0 => {
+                    brightness_pct = match brightness_pct {
+                        25 => 50,
+                        50 => 75,
+                        75 => 100,
+                        _ => 25,
+                    };
+                    torch_on = false;
+                    let duty = backlight.get_max_duty() * brightness_pct as u32 / 100;
+                    let _ = backlight.set_duty(duty);
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                1 => {
+                    torch_on = !torch_on;
+                    let duty = if torch_on {
+                        backlight.get_max_duty()
+                    } else {
+                        backlight.get_max_duty() * brightness_pct as u32 / 100
+                    };
+                    let _ = backlight.set_duty(duty);
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                2 => {
+                    run_stopwatch(display, btn_mid, btn_lft)?;
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                3 => {
+                    run_timer(display, btn_up, btn_dwn, btn_mid, btn_lft)?;
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                4 => {
+                    draw_nfc_status(display, "Redemarrage...")?;
+                    FreeRtos::delay_ms(800);
+                    unsafe { esp_idf_svc::sys::esp_restart() };
+                }
+                5 => {
+                    draw_nfc_status(display, "Extinction...")?;
+                    FreeRtos::delay_ms(500);
+                    unsafe {
+                        esp_idf_svc::sys::esp_sleep_enable_ext0_wakeup(
+                            esp_idf_svc::sys::gpio_num_t_GPIO_NUM_14,
+                            0,
+                        );
+                        esp_idf_svc::sys::esp_deep_sleep_start();
+                    }
+                }
+                6 => {
+                    draw_about(display)?;
+                    loop {
+                        if btn_mid.is_low() || btn_lft.is_low() {
+                            while btn_mid.is_low() || btn_lft.is_low() {
+                                FreeRtos::delay_ms(10);
+                            }
+                            break;
+                        }
+                        FreeRtos::delay_ms(20);
+                    }
+                    draw_settings_full(display, sel, view, brightness_pct)?;
+                }
+                _ => {}
+            }
+        }
+        FreeRtos::delay_ms(20);
+    }
+    Ok(())
+}
+
+fn draw_settings_full<D>(
+    display: &mut D,
+    selected: usize,
+    view: usize,
+    brightness_pct: u8,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Rectangle::new(Point::new(0, 0), Size::new(240, 28))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Text::with_text_style(
+        "SETTINGS",
+        Point::new(120, 20),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let end = (view + SETTINGS_VISIBLE).min(SETTINGS_ITEMS.len());
+    for abs_i in view..end {
+        let slot = abs_i - view;
+        let is_sel = abs_i == selected;
+        let y = settings_view_y(slot);
+        let (bg_color, txt_color) = if is_sel { (ORANGE, BLACK) } else { (BG, WHITE) };
+        Rectangle::new(Point::new(6, y), Size::new(228, 30))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(bg_color).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let label: std::borrow::Cow<str> = if abs_i == 0 {
+            format!("Luminosite: {}%", brightness_pct).into()
+        } else {
+            SETTINGS_ITEMS[abs_i].into()
+        };
+        Text::new(
+            &label,
+            Point::new(14, y + 22),
+            MonoTextStyle::new(&FONT_10X20, txt_color),
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+fn run_stopwatch<D>(
+    display: &mut D,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    let mut running = false;
+    let mut elapsed_us: i64 = 0;
+    let mut start_us: i64 = 0;
+
+    let draw = |display: &mut D, elapsed_us: i64, running: bool| -> anyhow::Result<()> {
+        let total_s = (elapsed_us / 1_000_000) as u64;
+        let ms = (elapsed_us % 1_000_000) / 10_000;
+        let time_str = format!(
+            "{:02}:{:02}:{:02}.{:02}",
+            total_s / 3600,
+            (total_s % 3600) / 60,
+            total_s % 60,
+            ms
+        );
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "CHRONOMETRE",
+            Point::new(120, 28),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            &time_str,
+            Point::new(120, 110),
+            MonoTextStyle::new(&FONT_10X20, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let hint = if running { "MID: pause  LFT: reset" } else { "MID: start  LFT: quitter" };
+        Text::with_text_style(
+            hint,
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Ok(())
+    };
+
+    draw(display, 0, false)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if running {
+                elapsed_us = 0;
+                running = false;
+                draw(display, 0, false)?;
+            } else {
+                break;
+            }
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if running {
+                let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                elapsed_us += now - start_us;
+                running = false;
+            } else {
+                start_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                running = true;
+            }
+        }
+        if running {
+            let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+            draw(display, elapsed_us + (now - start_us), true)?;
+        }
+        FreeRtos::delay_ms(50);
+    }
+    Ok(())
+}
+
+fn run_timer<D>(
+    display: &mut D,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    let mut duration_s: u64 = 60;
+
+    let draw_set = |display: &mut D, dur_s: u64| -> anyhow::Result<()> {
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "MINUTEUR",
+            Point::new(120, 28),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        let dur_str = format!("{:02}:{:02}", dur_s / 60, dur_s % 60);
+        Text::with_text_style(
+            &dur_str,
+            Point::new(120, 100),
+            MonoTextStyle::new(&FONT_10X20, WHITE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "UP/DOWN: regler",
+            Point::new(120, 150),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "MID: demarrer  LFT: quitter",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Ok(())
+    };
+
+    draw_set(display, duration_s)?;
+
+    // Phase 1: set duration
+    let started = loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(());
+        }
+        if btn_up.is_low() {
+            duration_s = duration_s.saturating_add(60).min(5940);
+            draw_set(display, duration_s)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            duration_s = duration_s.saturating_sub(60).max(60);
+            draw_set(display, duration_s)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        }
+        FreeRtos::delay_ms(20);
+    };
+
+    // Phase 2: countdown
+    loop {
+        let now = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+        let elapsed_s = (now - started) / 1_000_000;
+        let remaining = duration_s.saturating_sub(elapsed_s as u64);
+
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            "MINUTEUR",
+            Point::new(120, 28),
+            MonoTextStyle::new(&FONT_10X20, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        let color = if remaining <= 10 { ORANGE } else { WHITE };
+        let rem_str = format!("{:02}:{:02}", remaining / 60, remaining % 60);
+        Text::with_text_style(
+            &rem_str,
+            Point::new(120, 110),
+            MonoTextStyle::new(&FONT_10X20, color),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        Text::with_text_style(
+            "LFT: annuler",
+            Point::new(120, 220),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        if remaining == 0 {
+            for _ in 0..6u32 {
+                display.clear(ORANGE).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                FreeRtos::delay_ms(250);
+                display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                Text::with_text_style(
+                    "TERMINE!",
+                    Point::new(120, 120),
+                    MonoTextStyle::new(&FONT_10X20, WHITE),
+                    centered,
+                )
+                .draw(display)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                FreeRtos::delay_ms(250);
+            }
+            loop {
+                if btn_mid.is_low() || btn_lft.is_low() {
+                    while btn_mid.is_low() || btn_lft.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    break;
+                }
+                FreeRtos::delay_ms(20);
+            }
+            break;
+        }
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        FreeRtos::delay_ms(200);
+    }
+    Ok(())
+}
+
+fn draw_about<D>(display: &mut D) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "A propos",
+        Point::new(120, 28),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let ver = concat!("FW v", env!("CARGO_PKG_VERSION"));
+    Text::with_text_style(
+        ver,
+        Point::new(120, 70),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let uptime_s = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000;
+    let uptime_str = format!(
+        "Uptime: {:02}h{:02}m{:02}s",
+        uptime_s / 3600,
+        (uptime_s % 3600) / 60,
+        uptime_s % 60
+    );
+    Text::with_text_style(
+        &uptime_str,
+        Point::new(120, 110),
+        MonoTextStyle::new(&FONT_6X10, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+    let heap_str = format!("Heap libre: {} B", heap);
+    Text::with_text_style(
+        &heap_str,
+        Point::new(120, 130),
+        MonoTextStyle::new(&FONT_6X10, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID/LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+// ── Draw helpers ───────────────────────────────────────────────────────────
+
+/// Affiche une bannière "MAGIC GEN1A" en overlay rouge sur l'écran actuel.
+/// Ne clear pas le fond — ajoute juste l'indicateur en bas de l'écran.
+#[allow(dead_code)] // indicateur magic — câblé une fois la détection gen1a active
+fn draw_magic_indicator<D>(display: &mut D) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let red = Rgb565::new(31, 0, 0);
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 170), Size::new(240, 24))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(red).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "MAGIC GEN1A",
+        Point::new(120, 188),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    log::info!("*** MAGIC GEN1A — carte UID-modifiable ***");
+    Ok(())
+}
+
+fn draw_nfc_screen_with_cache<D>(
+    display: &mut D,
+    uid: Option<&heapless::String<32>>,
+    card_type: Option<&str>,
+    has_cached_dump: bool,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_nfc_screen(display, uid, card_type)?;
+    if uid.is_none() && has_cached_dump {
+        let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+        Text::with_text_style(
+            "UP: re-clone  DOWN: view",
+            Point::new(120, 200),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+fn draw_nfc_screen<D>(
+    display: &mut D,
+    uid: Option<&heapless::String<32>>,
+    card_type: Option<&str>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    match uid {
+        Some(hex) => {
+            Text::with_text_style(
+                "Carte detectee!",
+                Point::new(120, 80),
+                MonoTextStyle::new(&FONT_10X20, GREEN),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            if let Some(t) = card_type {
+                Text::with_text_style(
+                    t,
+                    Point::new(120, 105),
+                    MonoTextStyle::new(&FONT_6X10, ORANGE),
+                    centered,
+                )
+                .draw(display)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            }
+            Text::with_text_style(
+                "UID:",
+                Point::new(120, 130),
+                MonoTextStyle::new(&FONT_6X10, GRAY),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::with_text_style(
+                hex.as_str(),
+                Point::new(120, 155),
+                MonoTextStyle::new(&FONT_10X20, WHITE),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            let hint = match card_type {
+                Some(t) if t.contains("Classic") => "MID: dump  LFT: retour",
+                Some(_) => "MID: lire  LFT: retour",
+                None => "LFT: retour",
+            };
+            Text::with_text_style(
+                hint,
+                Point::new(120, 220),
+                MonoTextStyle::new(&FONT_6X10, GRAY),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+        None => {
+            Text::with_text_style(
+                "En attente...",
+                Point::new(120, 110),
+                MonoTextStyle::new(&FONT_10X20, GRAY),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::with_text_style(
+                "Approche une carte NFC",
+                Point::new(120, 140),
+                MonoTextStyle::new(&FONT_6X10, GRAY),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::with_text_style(
+                "RIGHT: dumps sauves",
+                Point::new(120, 175),
+                MonoTextStyle::new(&FONT_6X10, ORANGE),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::with_text_style(
+                "LFT: retour",
+                Point::new(120, 220),
+                MonoTextStyle::new(&FONT_6X10, GRAY),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // écran post-dump alternatif — conservé pour usage futur
+fn draw_post_dump<D>(
+    display: &mut D,
+    readable: usize,
+    total: usize,
+    acl: &axolotl_core::dump::AccessSummary,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let acl_summary = format!(
+        "ACL fact:{} cust:{} corr:{}",
+        acl.factory, acl.custom, acl.corrupt
+    );
+    Text::with_text_style(
+        &acl_summary,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("{}/{} blocs lus", readable, total);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, if readable > 0 { GREEN } else { GRAY }),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "clone: carte magic requise",
+        Point::new(120, 180),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID: cloner  LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn draw_post_ul_dump<D>(display: &mut D, pages: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "NFC / RFID",
+        Point::new(120, 40),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("{} pages lues", pages);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, GREEN),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "clone: NTAG/UL cible",
+        Point::new(120, 180),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID: cloner  LFT: retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Ok(())
+}
+
+fn draw_dump_progress<D>(display: &mut D, sector: u8, total: u8) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "Dump en cours...",
+        Point::new(120, 80),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let msg = format!("Secteur {}/{}", sector + 1, total);
+    Text::with_text_style(
+        &msg,
+        Point::new(120, 120),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Rectangle::new(Point::new(20, 150), Size::new(200, 14))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let t = total.max(1) as u32;
+    let filled = ((sector as u32 + 1) * 200 / t).min(200);
+    if filled > 0 {
+        Rectangle::new(Point::new(20, 150), Size::new(filled, 14))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(ORANGE).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    Ok(())
+}
+
+fn draw_nfc_status<D>(display: &mut D, msg: &str) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Text::with_text_style(
+        msg,
+        Point::new(120, 120),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Ok(())
+}
+
+fn draw_menu_full<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Text::with_text_style(
+        "AXOLOTL ZERO",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     for i in 0..MENU_ITEMS.len() {
         draw_menu_item(display, i, i == selected)?;
     }
@@ -188,33 +2638,52 @@ where D: DrawTarget<Color = Rgb565>, D::Error: core::fmt::Debug,
 }
 
 fn draw_menu_item<D>(display: &mut D, i: usize, selected: bool) -> anyhow::Result<()>
-where D: DrawTarget<Color = Rgb565>, D::Error: core::fmt::Debug,
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
 {
     let y = item_y(i);
-    let (bg_color, txt_color) = if selected { (ORANGE, BLACK) } else { (BG, WHITE) };
-
+    let (bg_color, txt_color) = if selected {
+        (ORANGE, BLACK)
+    } else {
+        (BG, WHITE)
+    };
     Rectangle::new(Point::new(10, y), Size::new(220, 28))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(bg_color).build())
-        .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
-    Text::new(MENU_ITEMS[i], Point::new(20, y + 20), MonoTextStyle::new(&FONT_10X20, txt_color))
-        .draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::new(
+        MENU_ITEMS[i],
+        Point::new(20, y + 20),
+        MonoTextStyle::new(&FONT_10X20, txt_color),
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Ok(())
 }
 
 fn draw_selected<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
-where D: DrawTarget<Color = Rgb565>, D::Error: core::fmt::Debug,
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
 {
     display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Text::with_text_style(
-        MENU_ITEMS[selected], Point::new(120, 100),
-        MonoTextStyle::new(&FONT_10X20, ORANGE), centered,
-    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
+        MENU_ITEMS[selected],
+        Point::new(120, 100),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Text::with_text_style(
-        "[ appuie pour revenir ]", Point::new(120, 140),
-        MonoTextStyle::new(&FONT_6X10, WHITE), centered,
-    ).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        "[ appuie pour revenir ]",
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_6X10, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Ok(())
 }
