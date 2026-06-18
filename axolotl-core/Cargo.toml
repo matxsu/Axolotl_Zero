@@ -1,0 +1,12 @@
+[package]
+name = "axolotl-core"
+version = "0.1.0"
+edition = "2021"
+
+# Pure logic crate — no ESP-IDF dependencies.
+# Used by the firmware crate AND testable on host with `cargo test`.
+
+[dependencies]
+heapless = "0.8"
+
+[dev-dependencies]
