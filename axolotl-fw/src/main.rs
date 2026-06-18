@@ -285,6 +285,7 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_lft,
                     &btn_up,
                     &btn_dwn,
+                    &btn_rht,
                 )?,
                 3 => run_storage_info(
                     &mut display,
@@ -336,6 +337,7 @@ fn run_nfc_scan<D>(
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_rht: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -350,6 +352,20 @@ where
     loop {
         if btn_lft.is_low() {
             break;
+        }
+        // RIGHT = menu des dumps sauvegardés (sélection → clone, sans re-scan)
+        if btn_rht.is_low() {
+            while btn_rht.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_saved_dumps(display, pn532, sd, btn_up, btn_dwn, btn_mid, btn_lft)?;
+            draw_nfc_screen_with_cache(
+                display,
+                None,
+                None,
+                last_dumps.classic.is_some() || last_dumps.ultralight.is_some(),
+            )?;
+            continue;
         }
         // UP = re-clone du dernier dump en RAM (classic en priorité)
         if btn_up.is_low() {
@@ -456,13 +472,16 @@ where
                         break;
                     }
                 }
-                if btn_lft.is_low() {
-                    break;
-                }
-                // Une carte détectée passe en état ACTIVE et ne répond plus à
-                // REQA tant qu'elle reste dans le champ → on power-cycle le champ
-                // pour pouvoir re-scanner (même carte ou une autre).
+                // Reset toujours — le PN532 doit revenir en état propre pour le
+                // prochain scan.
                 pn532.reset_field();
+                // LEFT ici signifiait "quitter cette carte", PAS "quitter le NFC".
+                // On consomme l'appui et on retourne au scan : poser une nouvelle
+                // carte la détecte directement. Pour sortir du NFC, ré-appuyer
+                // LEFT sur l'écran d'attente (test en haut de boucle).
+                while btn_lft.is_low() {
+                    FreeRtos::delay_ms(10);
+                }
                 draw_nfc_screen_with_cache(
                 display,
                 None,
@@ -471,7 +490,13 @@ where
             )?;
             }
             Ok(None) => {}
-            Err(_) => {}
+            Err(e) => {
+                // Erreur de comm (ex. "PN532 timeout") → re-init de récupération.
+                // Si ce log apparait a chaque scan, reset_field est encore en cause.
+                log::warn!("NFC scan err: {:?} — recover", e);
+                pn532.recover();
+                FreeRtos::delay_ms(200);
+            }
         }
         FreeRtos::delay_ms(300);
     }
@@ -503,15 +528,24 @@ where
             nfc::print_dump_log(&dump);
             let readable_count = dump.readable_count();
             let total = dump.total_blocks();
-            if let Some(sd) = sd.as_ref() {
-                let uid_str = hex.as_str().replace(':', "");
-                let _ = sd.write_file(
-                    &format!("/NFC/dumps/{}.mfd", uid_str),
-                    &dump.to_mfd_bytes(),
-                );
-                let mut txt = format!("UID: {}\nType: {:?}\n\n", hex.as_str(), dump.card_type);
-                for block in 0..total {
-                    if dump.readable[block] {
+            // Sauvegarde UNIQUEMENT les dumps complets (64/64) : un .mfd partiel
+            // se recharge avec tous les blocs marqués lisibles (from_mfd_bytes)
+            // → les zéros passeraient pour des vraies données au clone.
+            let complete = readable_count == total;
+            if complete {
+                if let Some(sd) = sd.as_ref() {
+                    let uid_str = hex.as_str().replace(':', "");
+                    // .mfd AVEC les clés réinjectées dans les trailers → re-clonable
+                    // depuis le fichier seul (menu RIGHT) sans re-scanner la carte.
+                    match sd.write_file(
+                        &format!("/NFC/dumps/{}.mfd", uid_str),
+                        &nfc::attacks::dump_to_mfd_with_keys(&dump, &found_keys),
+                    ) {
+                        Ok(_) => log::info!("Dump 64/64 sauvegarde : {}.mfd", uid_str),
+                        Err(e) => log::warn!("Sauvegarde .mfd KO: {:?}", e),
+                    }
+                    let mut txt = format!("UID: {}\nType: {:?}\n\n", hex.as_str(), dump.card_type);
+                    for block in 0..total {
                         let d = &dump.blocks[block];
                         txt.push_str(&format!(
                             "Bloc {:03}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}\n",
@@ -519,16 +553,16 @@ where
                             d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
                             d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]
                         ));
-                    } else {
-                        txt.push_str(&format!(
-                            "Bloc {:03}: -- non lisible --\n",
-                            block
-                        ));
                     }
+                    let _ = sd.write_file(
+                        &format!("/NFC/dumps/{}.txt", uid_str),
+                        txt.as_bytes(),
+                    );
                 }
-                let _ = sd.write_file(
-                    &format!("/NFC/dumps/{}.txt", uid_str),
-                    txt.as_bytes(),
+            } else {
+                log::info!(
+                    "Dump partiel {}/{} — non sauvegarde (incomplet)",
+                    readable_count, total
                 );
             }
             let acl = dump.access_summary();
@@ -1023,10 +1057,301 @@ where
         }
         Err(e) => {
             log::warn!("Clone err: {:?}", e);
-            draw_nfc_status(display, "Clone echoue")?;
+            // Garde-fou : cible non-magic → message explicite (rien n'a été
+            // écrit, la carte n'est pas abîmée).
+            let txt = e.to_string();
+            if txt.contains("non-magic") {
+                draw_nfc_status(
+                    display,
+                    "Cible non-magic\nbloc 0 verrouille\nclone annule (rien ecrit)",
+                )?;
+            } else {
+                draw_nfc_status(display, "Clone echoue")?;
+            }
         }
     }
     FreeRtos::delay_ms(4000);
+    Ok(())
+}
+
+// ── Dumps sauvegardés : sélection → clone ────────────────────────────────────
+
+/// Charge un .mfd depuis le stockage : infère le type carte d'après la taille
+/// et reconstruit les clés depuis les trailers (cf. `dump_to_mfd_with_keys`).
+fn load_dump_file(
+    sd: &dyn SdWrite,
+    path: &str,
+) -> Option<(nfc::MifareDump, Vec<nfc::attacks::SectorKey>)> {
+    let data = sd.read_file(path).ok()?;
+    let card_type = match data.len() {
+        320 => nfc::ClassicType::Mini,
+        1024 => nfc::ClassicType::Classic1K,
+        4096 => nfc::ClassicType::Classic4K,
+        _ => return None,
+    };
+    let dump = nfc::MifareDump::from_mfd_bytes(card_type, &data)?;
+    let keys = nfc::attacks::keys_from_dump(&dump);
+    Some((dump, keys))
+}
+
+/// Menu : liste les dumps complets sauvegardés et permet de les cloner sur une
+/// carte magic sans re-scanner la carte source.
+fn run_saved_dumps<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    sd: Option<&dyn SdWrite>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let sd = match sd {
+        Some(s) => s,
+        None => {
+            draw_nfc_status(display, "Pas de stockage")?;
+            FreeRtos::delay_ms(1500);
+            return Ok(());
+        }
+    };
+
+    let mut files: Vec<String> = sd
+        .list_dir("/NFC/dumps")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| n.ends_with(".mfd"))
+        .collect();
+    files.sort();
+
+    if files.is_empty() {
+        draw_nfc_status(display, "Aucun dump sauve\n(dump 64/64 requis)")?;
+        FreeRtos::delay_ms(2000);
+        return Ok(());
+    }
+
+    let mut sel = 0usize;
+    draw_dump_list(display, &files, sel)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = if sel == 0 { files.len() - 1 } else { sel - 1 };
+            draw_dump_list(display, &files, sel)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = (sel + 1) % files.len();
+            draw_dump_list(display, &files, sel)?;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            let path = format!("/NFC/dumps/{}", files[sel]);
+            match load_dump_file(sd, &path) {
+                Some((dump, keys)) => {
+                    run_saved_dump_action(
+                        display, pn532, &files[sel], &dump, &keys,
+                        btn_up, btn_dwn, btn_mid, btn_lft,
+                    )?;
+                }
+                None => {
+                    draw_nfc_status(display, "Lecture/format KO")?;
+                    FreeRtos::delay_ms(1500);
+                }
+            }
+            draw_dump_list(display, &files, sel)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+/// Écran d'action sur un dump sélectionné : MID=cloner, DOWN=voir, LFT=retour.
+fn run_saved_dump_action<D>(
+    display: &mut D,
+    pn532: &mut nfc::Pn532,
+    name: &str,
+    dump: &nfc::MifareDump,
+    keys: &[nfc::attacks::SectorKey],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_saved_dump_info(display, name, dump, keys.len())?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_nfc_clone(display, pn532, dump, keys, btn_lft)?;
+            draw_saved_dump_info(display, name, dump, keys.len())?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            run_view_dump(display, dump, btn_up, btn_dwn, btn_lft)?;
+            draw_saved_dump_info(display, name, dump, keys.len())?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn draw_dump_list<D>(display: &mut D, files: &[String], sel: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "DUMPS SAUVES",
+        Point::new(120, 28),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    // Fenêtre glissante de 7 entrées autour de la sélection.
+    const VISIBLE: usize = 7;
+    let start = if sel >= VISIBLE { sel - VISIBLE + 1 } else { 0 };
+    for (row, idx) in (start..files.len().min(start + VISIBLE)).enumerate() {
+        let y = 60 + row as i32 * 22;
+        let stem = files[idx].strip_suffix(".mfd").unwrap_or(&files[idx]);
+        let (prefix, color) = if idx == sel {
+            ("> ", GREEN)
+        } else {
+            ("  ", GRAY)
+        };
+        let line = format!("{}{}", prefix, stem);
+        Text::with_text_style(
+            &line,
+            Point::new(120, y),
+            MonoTextStyle::new(&FONT_10X20, color),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    Text::with_text_style(
+        "MID:ouvrir  UP/DN:nav  LFT:retour",
+        Point::new(120, 228),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Ok(())
+}
+
+fn draw_saved_dump_info<D>(
+    display: &mut D,
+    name: &str,
+    dump: &nfc::MifareDump,
+    key_count: usize,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "DUMP",
+        Point::new(120, 30),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let stem = name.strip_suffix(".mfd").unwrap_or(name);
+    Text::with_text_style(
+        stem,
+        Point::new(120, 70),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let info = format!(
+        "{:?}  {} blocs",
+        dump.card_type,
+        dump.total_blocks()
+    );
+    Text::with_text_style(
+        &info,
+        Point::new(120, 105),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    let keys_line = format!("{} cles dispo", key_count);
+    Text::with_text_style(
+        &keys_line,
+        Point::new(120, 130),
+        MonoTextStyle::new(&FONT_6X10, if key_count > 0 { GREEN } else { GRAY }),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    Text::with_text_style(
+        "MID: cloner (carte magic)",
+        Point::new(120, 185),
+        MonoTextStyle::new(&FONT_6X10, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "DOWN: voir blocs",
+        Point::new(120, 205),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "LFT: retour",
+        Point::new(120, 225),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Ok(())
 }
 
@@ -1954,6 +2279,7 @@ where
 
 /// Affiche une bannière "MAGIC GEN1A" en overlay rouge sur l'écran actuel.
 /// Ne clear pas le fond — ajoute juste l'indicateur en bas de l'écran.
+#[allow(dead_code)] // indicateur magic — câblé une fois la détection gen1a active
 fn draw_magic_indicator<D>(display: &mut D) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -2089,6 +2415,14 @@ where
             .draw(display)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
             Text::with_text_style(
+                "RIGHT: dumps sauves",
+                Point::new(120, 175),
+                MonoTextStyle::new(&FONT_6X10, ORANGE),
+                centered,
+            )
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::with_text_style(
                 "LFT: retour",
                 Point::new(120, 220),
                 MonoTextStyle::new(&FONT_6X10, GRAY),
@@ -2101,6 +2435,7 @@ where
     Ok(())
 }
 
+#[allow(dead_code)] // écran post-dump alternatif — conservé pour usage futur
 fn draw_post_dump<D>(
     display: &mut D,
     readable: usize,

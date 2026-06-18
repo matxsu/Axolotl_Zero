@@ -40,6 +40,7 @@ pub enum PrngType {
 }
 
 /// Résultat complet de la probe Darkside.
+#[allow(dead_code)] // champs lus une fois l'attaque darkside complète câblée
 pub struct DarksideProbe {
     pub prng: PrngType,
     pub parity_control: bool, // true si le PN532 a accepté WriteRegister CIU
@@ -269,6 +270,7 @@ pub fn run_attack<F: FnMut(u32, u32)>(
 
 /// Exporte les paires (NT, ks4) collectées vers le moniteur série
 /// pour analyse offline (format compatible mfcuk/mfoc).
+#[allow(dead_code)] // appelé depuis le sous-menu attaques darkside (à câbler)
 pub fn log_for_offline(uid: &NfcUid, fixed_nt: u32, ks4_samples: &[(u32, u8)]) {
     log::info!("=== DARKSIDE EXPORT (pour analyse offline) ===");
     log::info!("UID={:02X}:{:02X}:{:02X}:{:02X}",
