@@ -19,6 +19,57 @@ pub struct SectorKey {
     pub key: [u8; 6],
 }
 
+/// Sérialise le dump au format .mfd en RÉINJECTANT les clés trouvées dans les
+/// trailers (la carte renvoie KeyA masquée à 00 ; un .mfd standard Proxmark/
+/// Flipper contient les vraies clés). Le dump en RAM reste inchangé.
+///
+/// Ce format permet de re-cloner plus tard depuis le fichier seul, sans
+/// re-scanner la carte source ni reconserver les clés à part.
+pub fn dump_to_mfd_with_keys(dump: &MifareDump, keys: &[SectorKey]) -> Vec<u8> {
+    let mut bytes = dump.to_mfd_bytes();
+    let card_type = dump.card_type;
+    for k in keys {
+        if let Some(trailer) = card_type.sector_trailer(k.sector) {
+            let off = trailer as usize * 16;
+            if off + 16 <= bytes.len() {
+                if k.key_ab == 0 {
+                    bytes[off..off + 6].copy_from_slice(&k.key);
+                } else {
+                    bytes[off + 10..off + 16].copy_from_slice(&k.key);
+                }
+            }
+        }
+    }
+    bytes
+}
+
+/// Reconstruit la liste des clés à partir des trailers d'un dump chargé depuis
+/// un .mfd (cf. [`dump_to_mfd_with_keys`]). KeyA = bytes [0..6], KeyB = [10..16].
+/// Les clés nulles (00..00 = jamais injectées) sont ignorées.
+pub fn keys_from_dump(dump: &MifareDump) -> Vec<SectorKey> {
+    let mut out = Vec::new();
+    let card_type = dump.card_type;
+    for sector in 0..card_type.sector_count() {
+        let trailer = match card_type.sector_trailer(sector) {
+            Some(t) => t as usize,
+            None => continue,
+        };
+        if trailer >= dump.blocks.len() || !dump.readable[trailer] {
+            continue;
+        }
+        let blk = &dump.blocks[trailer];
+        let key_a: [u8; 6] = blk[0..6].try_into().unwrap();
+        if key_a != [0u8; 6] {
+            out.push(SectorKey { sector, key_ab: 0, key: key_a });
+        }
+        let key_b: [u8; 6] = blk[10..16].try_into().unwrap();
+        if key_b != [0u8; 6] && key_b != key_a {
+            out.push(SectorKey { sector, key_ab: 1, key: key_b });
+        }
+    }
+    out
+}
+
 pub fn dump_all_sectors<F: FnMut(u8, u8)>(
     pn532: &mut Pn532,
     uid: &NfcUid,
@@ -50,10 +101,15 @@ pub fn dump_all_sectors<F: FnMut(u8, u8)>(
 
         log::info!("┌─ Secteur {:02}/{} ───────────────────────────", sector, total - 1);
 
-        if try_sector(pn532, &mut dump, sector, trailer, &uid4, &mut found_keys) {
-            found_sectors += 1;
-        } else {
-            log::warn!("└─ Secteur {:02}: ECHEC — aucune cle valide", sector);
+        match try_sector(pn532, &mut dump, sector, trailer, &uid4, &mut found_keys) {
+            Some(true) => { found_sectors += 1; }
+            Some(false) => {
+                log::warn!("└─ Secteur {:02}: ECHEC — aucune cle valide", sector);
+            }
+            None => {
+                log::warn!("└─ Secteur {:02}: Carte absente — dump abandonne", sector);
+                break;
+            }
         }
     }
 
@@ -70,6 +126,8 @@ pub fn dump_all_sectors<F: FnMut(u8, u8)>(
     (dump, found_keys)
 }
 
+/// Retourne `None` si la carte a quitté le champ (dump doit s'arrêter),
+/// `Some(true/false)` si le secteur a pu/n'a pas pu être lu.
 fn try_sector(
     pn532: &mut Pn532,
     dump: &mut MifareDump,
@@ -77,7 +135,7 @@ fn try_sector(
     trailer: u8,
     uid4: &[u8; 4],
     found_keys: &mut Vec<SectorKey>,
-) -> bool {
+) -> Option<bool> {
     let n = DEFAULT_KEYS.len();
 
     // ── KeyA ──────────────────────────────────────────────────────────────
@@ -95,11 +153,11 @@ fn try_sector(
             found_keys.push(SectorKey { sector, key_ab: 0, key: *key });
             read_sector_blocks(pn532, dump, sector);
             log::info!("└─ Secteur {:02}: OK ({} blocs)", sector, dump_sector_block_count(dump, sector));
-            return true;
+            return Some(true);
         }
         if !re_select_with_retry(pn532) {
             log::warn!("│  Carte perdue apres {} tentatives re_select", RE_SELECT_RETRIES);
-            return false;
+            return None;
         }
     }
 
@@ -118,15 +176,15 @@ fn try_sector(
             found_keys.push(SectorKey { sector, key_ab: 1, key: *key });
             read_sector_blocks(pn532, dump, sector);
             log::info!("└─ Secteur {:02}: OK ({} blocs)", sector, dump_sector_block_count(dump, sector));
-            return true;
+            return Some(true);
         }
         if !re_select_with_retry(pn532) {
             log::warn!("│  Carte perdue apres {} tentatives re_select", RE_SELECT_RETRIES);
-            return false;
+            return None;
         }
     }
 
-    false
+    Some(false)
 }
 
 fn re_select_with_retry(pn532: &mut Pn532) -> bool {

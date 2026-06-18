@@ -20,6 +20,7 @@ const FLASH_MOUNT: &str = "/spiflash";
 /// Permet de passer `&dyn SdWrite` sans exposer le type générique complet.
 pub trait SdWrite {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()>;
+    fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>>;
     fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>>;
 }
 
@@ -96,6 +97,7 @@ where
     }
 
     /// Vérifie si un fichier existe.
+    #[allow(dead_code)]
     pub fn exists(&self, path: &str) -> bool {
         fs::metadata(format!("{}{}", MOUNT_POINT, path)).is_ok()
     }
@@ -107,6 +109,10 @@ where
 {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         SdStorage::write_file(self, path, data)
+    }
+
+    fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        SdStorage::read_file(self, path)
     }
 
     fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
@@ -180,6 +186,7 @@ impl InternalFs {
         Ok(names)
     }
 
+    #[allow(dead_code)]
     pub fn exists(&self, path: &str) -> bool {
         fs::metadata(format!("{}{}", FLASH_MOUNT, path)).is_ok()
     }
@@ -188,6 +195,10 @@ impl InternalFs {
 impl SdWrite for InternalFs {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         InternalFs::write_file(self, path, data)
+    }
+
+    fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
+        InternalFs::read_file(self, path)
     }
 
     fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {

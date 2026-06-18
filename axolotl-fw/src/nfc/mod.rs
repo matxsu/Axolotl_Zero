@@ -12,7 +12,7 @@ pub mod nested;
 
 // Re-exports depuis axolotl-core pour que main.rs puisse écrire `nfc::NfcUid`
 // sans changer ses imports actuels.
-pub use axolotl_core::{card::NfcUid, dump::MifareDump};
+pub use axolotl_core::{card::NfcUid, dump::MifareDump, layout::ClassicType};
 
 use axolotl_core::protocol::{MIFARE_AUTH_A, MIFARE_READ, MIFARE_UL_WRITE, MIFARE_WRITE};
 
@@ -33,9 +33,12 @@ const CMD_RF_CONFIGURATION: u8 = 0x32;
 // CIU_ManualRCV (0x630D) : bit 4 = ParityDisable
 const CIU_MANUAL_RCV_REG: u16 = 0x630D;
 // CIU_TxMode (0x6308) : bit 7 = TxCRCEn (1=CIU appende CRC en TX)
+#[allow(dead_code)] // réservé attaques bas-niveau (nested/darkside)
 const CIU_TX_MODE_REG: u16 = 0x6308;
 // CIU_RxMode (0x6309) : bit 7 = RxCRCEn (1=CIU vérifie CRC en RX)
+#[allow(dead_code)]
 const CIU_RX_MODE_REG: u16 = 0x6309;
+#[allow(dead_code)]
 const CMD_READ_REGISTER: u8 = 0x06;
 
 // ── Framing ────────────────────────────────────────────────────────────────
@@ -59,20 +62,40 @@ impl<'d> Pn532<'d> {
         let mut pn532 = Self { i2c };
         FreeRtos::delay_ms(500);
 
-        // Wakeup : 0x55 × 16 pour sortir le PN532 du power-down
-        let wakeup = [0x55u8; 16];
-        let _ = pn532.i2c.write(PN532_ADDR, &wakeup, BLOCK);
-        FreeRtos::delay_ms(100);
+        // Probe firmware avec retries : au boot, le bus I²C / PN532 peut ne pas
+        // être prêt du premier coup (write ESP_FAIL observé). On réessaye tout le
+        // handshake (wakeup + flush + GetFirmwareVersion) plutôt que de tuer
+        // l'app — avant, un seul échec faisait `return Err` → reboot complet.
+        let mut ver = [0u8; 3];
+        let mut ok = false;
+        for attempt in 0..10 {
+            // Wakeup : 0x55 × 16 pour sortir le PN532 du power-down
+            let wakeup = [0x55u8; 16];
+            let _ = pn532.i2c.write(PN532_ADDR, &wakeup, BLOCK);
+            FreeRtos::delay_ms(100);
 
-        // Flush du bus I²C (stabilisation)
-        for _ in 0..10 {
-            let mut rdy = [0u8; 1];
-            let _ = pn532.i2c.read(PN532_ADDR, &mut rdy, BLOCK);
-            FreeRtos::delay_ms(20);
+            // Flush du bus I²C (stabilisation)
+            for _ in 0..10 {
+                let mut rdy = [0u8; 1];
+                let _ = pn532.i2c.read(PN532_ADDR, &mut rdy, BLOCK);
+                FreeRtos::delay_ms(20);
+            }
+            FreeRtos::delay_ms(100);
+
+            match pn532.get_firmware_version() {
+                Ok(v) if v[0] != 0 => {
+                    ver = v;
+                    ok = true;
+                    break;
+                }
+                Ok(_) => log::warn!("PN532 probe {}/10 : reponse vide", attempt + 1),
+                Err(e) => log::warn!("PN532 probe {}/10 : {:?}", attempt + 1, e),
+            }
+            FreeRtos::delay_ms(150);
         }
-        FreeRtos::delay_ms(100);
-
-        let ver = pn532.get_firmware_version()?;
+        if !ok {
+            return Err(anyhow::anyhow!("PN532 introuvable apres 10 essais"));
+        }
         log::info!(
             "PN532 OK — IC={:#02x} Ver={} Rev={}",
             ver[0],
@@ -81,6 +104,13 @@ impl<'d> Pn532<'d> {
         );
 
         pn532.sam_configuration()?;
+        // MxRtyPassiveActivation=2 : InListPassiveTarget termine en <20ms si
+        // aucune carte n'est présente. Sans ça, le PN532 tourne indéfiniment,
+        // le wait_ready(30) de read_uid expire, et la prochaine commande I²C
+        // arrive pendant que le PN532 est encore occupé → corruption du bus.
+        let _ = pn532.send_frame(CMD_RF_CONFIGURATION, &[0x05, 0xFF, 0x01, 0x02]);
+        let _ = pn532.read_ack();
+        let _ = pn532.read_response(CMD_RF_CONFIGURATION);
         log::info!("PN532 pret");
         Ok(pn532)
     }
@@ -154,6 +184,9 @@ impl<'d> Pn532<'d> {
     }
 
     /// Attend RDY == 0x01, max_tries × 10 ms.
+    // TODO(nfc): si "PN532 timeout" réapparaît, distinguer ici (a) i2c.read Err
+    // (NACK bus) vs (b) read OK mais rdy != 0x01 (PN532 jamais prêt) — un log
+    // unique transforme le diagnostic en certitude au lieu de tâtonner.
     fn wait_ready(&mut self, max_tries: u32) -> anyhow::Result<()> {
         for _ in 0..max_tries {
             let mut rdy = [0u8; 1];
@@ -186,6 +219,7 @@ impl<'d> Pn532<'d> {
     // ── Primitives bas-niveau : InCommunicateThru / CRC-A / nonce brut ───
 
     /// CRC-A ISO 14443-A (poly 0x1021, init 0x6363).
+    #[allow(dead_code)] // utilisé par les attaques bas-niveau (nested/darkside)
     pub fn crc_a(data: &[u8]) -> [u8; 2] {
         let mut crc: u16 = 0x6363;
         for &byte in data {
@@ -241,6 +275,7 @@ impl<'d> Pn532<'d> {
     }
 
     /// Lit un registre CIU via ReadRegister (cmd 0x06).
+    #[allow(dead_code)] // utilisé par les attaques bas-niveau (nested/darkside)
     fn read_register(&mut self, addr: u16) -> u8 {
         let hi = (addr >> 8) as u8;
         let lo = (addr & 0xFF) as u8;
@@ -257,6 +292,7 @@ impl<'d> Pn532<'d> {
     }
 
     /// Écrit un registre CIU via WriteRegister (cmd 0x08).
+    #[allow(dead_code)] // utilisé par les attaques bas-niveau (nested/darkside)
     fn write_register_raw(&mut self, addr: u16, val: u8) {
         let hi = (addr >> 8) as u8;
         let lo = (addr & 0xFF) as u8;
@@ -438,6 +474,25 @@ impl<'d> Pn532<'d> {
     /// Fix : cycle RF (off → on) après InRelease. La carte perd l'alimentation,
     /// son état HALT est effacé. Au rallumage elle revient en IDLE et répond à REQA.
     pub fn re_select(&mut self) -> bool {
+        self.rf_cycle();
+        for i in 0..10 {
+            if matches!(self.read_uid(), Ok(Some(_))) {
+                log::debug!("Badge réveillé (tentative {})", i + 1);
+                return true;
+            }
+            FreeRtos::delay_ms(50);
+        }
+        false
+    }
+
+    /// Cycle RF off→on : InRelease (libère la cible + HLTA) puis coupe/rallume le
+    /// champ pour power-cycler toute carte présente (HALT/ACTIVE → IDLE), de
+    /// nouveau détectable. C'est la SEULE séquence prouvée fiable (re_select la
+    /// lance des dizaines de fois par dump sans wedger le bus). Aucune autre
+    /// commande (SAMConfiguration, MaxRetries…) ne doit s'ajouter ici : chaque
+    /// commande en plus = une occasion de désync du buffer I²C (pas d'IRQ, tout
+    /// repose sur le polling RDY).
+    fn rf_cycle(&mut self) {
         self.in_release();
 
         // RF OFF : 100ms suffisent pour vider le condensateur (~50ms typique).
@@ -453,37 +508,41 @@ impl<'d> Pn532<'d> {
         let _ = self.read_response(CMD_RF_CONFIGURATION);
 
         FreeRtos::delay_ms(60);
-
-        for i in 0..10 {
-            if matches!(self.read_uid(), Ok(Some(_))) {
-                log::debug!("Badge réveillé (tentative {})", i + 1);
-                return true;
-            }
-            FreeRtos::delay_ms(50);
-        }
-        false
     }
 
     /// Réinitialise le champ RF pour autoriser une NOUVELLE détection.
     ///
     /// Après `read_uid` (InListPassiveTarget → REQA), la carte passe en état
     /// ACTIVE et **ne répond plus à REQA** : impossible de la re-détecter tant
-    /// qu'elle reste dans le champ. De plus le PN532 garde la cible activée, ce
-    /// qui peut bloquer le prochain InListPassiveTarget.
+    /// qu'elle reste dans le champ. On power-cycle le champ (cf. [`rf_cycle`])
+    /// pour la remettre en IDLE. La boucle de scan re-détecte ensuite.
     ///
-    /// On libère la cible (InRelease + HLTA) puis on coupe/rallume le champ pour
-    /// power-cycler toute carte présente en IDLE → de nouveau détectable.
-    /// Pas de `read_uid` final : la boucle de scan re-détecte proprement ensuite.
+    /// Identique au noyau de `re_select` : exactement la séquence prouvée fiable,
+    /// rien de plus (pas de SAMConfiguration ni MaxRetries — voir [`recover`]).
     pub fn reset_field(&mut self) {
-        self.in_release();
-        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x01, 0x00]);
+        self.rf_cycle();
+    }
+
+    /// Récupération lourde après une erreur de communication (ex. "PN532
+    /// timeout") : draine d'éventuels octets bufferisés (une trame non lue
+    /// décale tous les reads suivants), puis ré-applique SAMConfiguration +
+    /// MaxRetries.
+    ///
+    /// À appeler UNIQUEMENT depuis le handler d'erreur du scan. Si ça se
+    /// déclenche à chaque scan, c'est que `reset_field` est encore en cause —
+    /// c'est le signal, pas une invitation à empiler des commandes ailleurs.
+    pub fn recover(&mut self) {
+        log::warn!("PN532 recover: re-init apres erreur de comm");
+        for _ in 0..6 {
+            let mut buf = [0u8; 32];
+            let _ = self.i2c.read(PN532_ADDR, &mut buf, BLOCK);
+            FreeRtos::delay_ms(5);
+        }
+        FreeRtos::delay_ms(20);
+        let _ = self.sam_configuration();
+        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x05, 0xFF, 0x01, 0x02]);
         let _ = self.read_ack();
         let _ = self.read_response(CMD_RF_CONFIGURATION);
-        FreeRtos::delay_ms(120);
-        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x01, 0x02]);
-        let _ = self.read_ack();
-        let _ = self.read_response(CMD_RF_CONFIGURATION);
-        FreeRtos::delay_ms(50);
     }
 
     // ── API publique — restore MIFARE ────────────────────────────────────
@@ -494,6 +553,7 @@ impl<'d> Pn532<'d> {
     ///   écraser les clés et access bits de la carte cible.
     /// - `on_sector(sector)` : callback de progression (0..15).
     /// Retourne le nombre de blocs écrits avec succès.
+    #[allow(dead_code)] // restore vers carte cible standard — gardé pour usage futur
     pub fn mifare_restore<F: FnMut(u8, u8)>(
         &mut self,
         uid: &NfcUid,
@@ -615,10 +675,19 @@ impl<'d> Pn532<'d> {
         let mut written = 0u32;
         let mut block0_written = false;
 
-        // ── Diagnostic d'entrée : identité cible + test gen2/CUID ──────────
-        // Test NON DESTRUCTIF : on relit le bloc 0 de la carte cible et on
-        // réécrit ses PROPRES octets. Si le WRITE est accepté → gen2/CUID.
+        // ── GARDE-FOU : la cible doit être magic (bloc 0 réinscriptible) ───
+        // Test NON DESTRUCTIF : auth secteur 0, relire bloc 0, réécrire ses
+        // PROPRES octets. Si le WRITE passe → gen2/CUID. On essaye FFFF (carte
+        // vierge) PUIS la KeyA reconstruite (re-clone d'une magic déjà clonée).
+        //
+        // Si le bloc 0 n'est PAS réinscriptible → carte standard/gen1a → on
+        // ABANDONNE sans rien écrire : un clone partiel sur carte non-magic
+        // réécrit les trailers et BRICK les secteurs (cas vécu sur 8E:0C:19:03).
+        let recon0 = Self::reconstruct_trailer(0, dump, keys, reversible);
+        let key_a0: [u8; 6] = recon0[0..6].try_into().unwrap();
+
         self.re_select();
+        let mut block0_writable = false;
         match self.read_uid() {
             Ok(Some(u)) => {
                 log::info!(
@@ -626,26 +695,37 @@ impl<'d> Pn532<'d> {
                     u.bytes[0], u.bytes[1], u.bytes[2], u.bytes[3], u.sak
                 );
                 let uid4 = [u.bytes[0], u.bytes[1], u.bytes[2], u.bytes[3]];
-                if self.mifare_auth(0, MIFARE_AUTH_A, &[0xFFu8; 6], &uid4).is_ok() {
-                    match self.mifare_read_block(0) {
-                        Ok(orig0) => match self.mifare_write_block(0, &orig0) {
-                            Ok(_) => log::info!(
-                                "Test gen2 : bloc 0 REINSCRIPTIBLE -> carte gen2/CUID ✓"
-                            ),
-                            Err(e) => log::info!(
-                                "Test gen2 : bloc 0 verrouille ({:?}) -> carte standard/gen1a",
-                                e
-                            ),
-                        },
-                        Err(e) => log::warn!("Test gen2 : lecture bloc 0 KO: {:?}", e),
+                for cand in [[0xFFu8; 6], key_a0] {
+                    if self.mifare_auth(0, MIFARE_AUTH_A, &cand, &uid4).is_ok() {
+                        if let Ok(orig0) = self.mifare_read_block(0) {
+                            if self.mifare_write_block(0, &orig0).is_ok() {
+                                block0_writable = true;
+                                log::info!("Test gen2 : bloc 0 REINSCRIPTIBLE -> gen2/CUID ✓");
+                                break;
+                            } else {
+                                log::info!("Test gen2 : bloc 0 verrouille -> carte standard/gen1a");
+                            }
+                        }
                     }
-                } else {
-                    log::warn!("Test gen2 : auth FF secteur 0 KO (carte non vierge ?)");
+                    self.re_select();
+                }
+                if !block0_writable {
+                    log::warn!("Test gen2 : auth/write bloc 0 KO (cible non-magic ou cles inconnues)");
                 }
             }
             _ => log::warn!("Clone : aucune carte cible au demarrage"),
         }
         self.re_select();
+
+        // Abandon AVANT toute écriture si la cible n'est pas magic.
+        // TODO(nfc): support gen1a — bloc 0 via backdoor 0x40 (7-bit framing),
+        // pas par WRITE normal. clone_to_magic gère gen2/CUID uniquement ;
+        // router les gen1a vers un clone_gen1a basé sur wipe_gen1a (WIP).
+        if !block0_writable {
+            log::warn!("Clone ANNULE : cible non-magic (bloc 0 non reinscriptible) — rien ecrit");
+            self.reset_field();
+            return Err(anyhow::anyhow!("cible non-magic (bloc 0 verrouille)"));
+        }
 
         for sector in 0..total {
             on_sector(sector, total);
@@ -663,12 +743,12 @@ impl<'d> Pn532<'d> {
                 Ok(Some(u)) => u,
                 _ => {
                     if !self.re_select() {
-                        log::warn!("Clone secteur {:02}: carte perdue", sector);
-                        continue;
+                        log::warn!("Clone secteur {:02}: carte perdue — arret", sector);
+                        break;
                     }
                     match self.read_uid() {
                         Ok(Some(u)) => u,
-                        _ => continue,
+                        _ => break,
                     }
                 }
             };
@@ -757,6 +837,7 @@ impl<'d> Pn532<'d> {
             written,
             block0_written
         );
+        self.reset_field();
         Ok((written, block0_written))
     }
 
@@ -863,7 +944,6 @@ impl<'d> Pn532<'d> {
         let mut written = 0u8;
         // Blocs 1..63 (bloc 0 = UID, on ne touche pas)
         for blk in 1u8..64 {
-            let sector = blk / 4;
             let is_trailer = (blk % 4) == 3;
             let data = if is_trailer { &TRANSPORT_TRAILER } else { &ZERO_BLOCK };
 
