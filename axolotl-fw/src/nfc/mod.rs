@@ -12,7 +12,19 @@ pub mod attacks;
 // sans changer ses imports actuels.
 pub use axolotl_core::{card::NfcUid, dump::MifareDump, layout::ClassicType};
 
-use axolotl_core::protocol::{MIFARE_AUTH_A, MIFARE_READ, MIFARE_UL_WRITE, MIFARE_WRITE};
+use axolotl_core::protocol::{
+    MIFARE_AUTH_A, MIFARE_AUTH_B, MIFARE_READ, MIFARE_UL_WRITE, MIFARE_WRITE,
+};
+
+/// Trailer « transport state » NXP : KeyA=FF…, access bits d'usine (FF 07 80 69),
+/// KeyB=FF…. Valeur sûre — NE JAMAIS recalculer les access bits à la main : un
+/// octet faux brique définitivement le secteur. Partagé wipe_gen1a / wipe_to_blank.
+const TRANSPORT_TRAILER: [u8; 16] = [
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyA
+    0xFF, 0x07, 0x80, 0x69, // Access bits transport
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyB
+];
+const ZERO_BLOCK: [u8; 16] = [0u8; 16];
 
 // ── Adresse I²C ────────────────────────────────────────────────────────────
 const PN532_ADDR: u8 = 0x24;
@@ -730,13 +742,6 @@ impl<'d> Pn532<'d> {
         }
         log::info!("wipe_gen1a: backdoor ouvert");
 
-        const TRANSPORT_TRAILER: [u8; 16] = [
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyA
-            0xFF, 0x07, 0x80, 0x69, // Access bits transport
-            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyB
-        ];
-        const ZERO_BLOCK: [u8; 16] = [0u8; 16];
-
         let mut written = 0u8;
         // Blocs 1..63 (bloc 0 = UID, on ne touche pas)
         for blk in 1u8..64 {
@@ -773,6 +778,178 @@ impl<'d> Pn532<'d> {
         self.reset_field();
         log::info!("wipe_gen1a: {}/63 blocs effacés", written);
         (written, 63)
+    }
+
+    /// Remet une carte magic à blanc (transport state NXP), bloc 0 (UID) conservé.
+    ///
+    /// Gère les deux familles automatiquement :
+    /// - **gen1a** : effacement via backdoor `0x40/0x43` (cf. [`Self::wipe_gen1a`]),
+    ///   sans authentification.
+    /// - **gen2/CUID** : pas de backdoor → authentification secteur par secteur.
+    ///   Clés essayées dans l'ordre : `FF`/`00` (carte vierge ou transport), puis
+    ///   les clés du dernier dump en RAM (`last_keys`, pour re-wiper une carte qu'on
+    ///   vient de cloner), puis le dictionnaire complet en dernier recours.
+    ///
+    /// Critère de succès = le **WRITE** est ACK : une auth réussie ne garantit pas
+    /// le droit d'écriture (access bits) ; en cas de NAK on retente avec l'autre clé
+    /// (A↔B). Chaque échec d'auth/write fait passer la carte en HALT → `re_select`
+    /// avant chaque tentative (cf. CLAUDE.md piège #2).
+    ///
+    /// Retourne (blocs_effacés, blocs_total) — bloc 0 exclu du compte.
+    pub fn wipe_to_blank<F: FnMut(u8, u8)>(
+        &mut self,
+        last_keys: &[attacks::SectorKey],
+        mut on_block: F,
+    ) -> (u8, u8) {
+        // 1) gen1a : tente le backdoor d'abord. Sur une carte non-gen1a, wipe_gen1a
+        //    abandonne proprement (reset_field) et renvoie (0, _) sans rien casser.
+        let (g1, t1) = self.wipe_gen1a(&mut on_block);
+        if g1 > 0 {
+            return (g1, t1);
+        }
+
+        // 2) gen2/CUID : auth + write secteur par secteur.
+        self.reset_field();
+        if !self.re_select() {
+            log::warn!("wipe_to_blank: carte absente (gen2)");
+            return (0, 0);
+        }
+        let uid = match self.read_uid() {
+            Ok(Some(u)) => u,
+            _ => {
+                log::warn!("wipe_to_blank: read_uid KO (gen2)");
+                return (0, 0);
+            }
+        };
+        let uid4 = [uid.bytes[0], uid.bytes[1], uid.bytes[2], uid.bytes[3]];
+        let card_type = ClassicType::from_sak(uid.sak).unwrap_or(ClassicType::Classic1K);
+        let total_sectors = card_type.sector_count();
+        log::info!("wipe_to_blank: gen2/CUID — {} secteurs", total_sectors);
+
+        let mut written = 0u8;
+        let mut total = 0u8;
+        for sector in 0..total_sectors {
+            let first = match card_type.sector_first_block(sector) {
+                Some(b) => b,
+                None => break,
+            };
+            let trailer = match card_type.sector_trailer(sector) {
+                Some(t) => t,
+                None => break,
+            };
+            // Clé valide réutilisée d'un bloc à l'autre du secteur (évite de re-balayer
+            // tout le dico pour chaque bloc une fois la bonne clé trouvée).
+            let mut working: Option<(u8, [u8; 6])> = None;
+
+            // Data blocks d'abord, trailer EN DERNIER : écrire le trailer rebascule
+            // les clés du secteur en transport (FF) → tout data écrit après aurait
+            // besoin d'une ré-auth FF (même logique que clone_to_magic).
+            for blk in first..trailer {
+                if blk == 0 {
+                    continue; // bloc 0 (UID) conservé — anti-brick
+                }
+                total += 1;
+                if self.wipe_block_any_key(blk, &ZERO_BLOCK, &uid4, sector, last_keys, &mut working) {
+                    written += 1;
+                    on_block(blk, 0x00);
+                } else {
+                    log::warn!("wipe gen2 blk{}: aucune cle valide en ecriture", blk);
+                    on_block(blk, 0xFF);
+                }
+            }
+            // Trailer → transport state, en dernier. NAK ici = secteur PAS vierge
+            // (garde ses anciennes clés) → compté comme échec.
+            total += 1;
+            if self.wipe_block_any_key(
+                trailer,
+                &TRANSPORT_TRAILER,
+                &uid4,
+                sector,
+                last_keys,
+                &mut working,
+            ) {
+                written += 1;
+                on_block(trailer, 0x00);
+            } else {
+                log::warn!("wipe gen2 trailer{}: NAK — secteur garde ses cles", trailer);
+                on_block(trailer, 0xFF);
+            }
+        }
+
+        self.reset_field();
+        log::info!("wipe_to_blank gen2: {}/{} blocs effaces", written, total);
+        (written, total)
+    }
+
+    /// Écrit `data` dans `block` en cherchant une clé qui authentifie *et* autorise
+    /// l'écriture. Ordre : clé déjà validée pour le secteur (`working`), puis `FF`/`00`,
+    /// puis `last_keys` du secteur, puis dictionnaire complet — chaque clé testée en
+    /// KeyA puis KeyB. Renvoie `true` dès que le WRITE est ACK.
+    fn wipe_block_any_key(
+        &mut self,
+        block: u8,
+        data: &[u8; 16],
+        uid4: &[u8; 4],
+        sector: u8,
+        last_keys: &[attacks::SectorKey],
+        working: &mut Option<(u8, [u8; 6])>,
+    ) -> bool {
+        // 1) clé déjà validée pour ce secteur
+        if let Some((ab, k)) = *working {
+            if self.try_auth_write(block, data, uid4, ab, &k) {
+                return true;
+            }
+        }
+        // 2) FF / 00 (carte vierge ou transport), KeyA puis KeyB
+        for k in [[0xFFu8; 6], [0x00u8; 6]] {
+            for ab in 0u8..2 {
+                if self.try_auth_write(block, data, uid4, ab, &k) {
+                    *working = Some((ab, k));
+                    return true;
+                }
+            }
+        }
+        // 3) clés du dernier dump pour ce secteur
+        for sk in last_keys.iter().filter(|s| s.sector == sector) {
+            if self.try_auth_write(block, data, uid4, sk.key_ab, &sk.key) {
+                *working = Some((sk.key_ab, sk.key));
+                return true;
+            }
+        }
+        // 4) dictionnaire complet, KeyA puis KeyB (dernier recours)
+        for k in axolotl_core::keys::DEFAULT_KEYS {
+            for ab in 0u8..2 {
+                if self.try_auth_write(block, data, uid4, ab, k) {
+                    *working = Some((ab, *k));
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Une tentative atomique : `re_select` (récupère un éventuel HALT) → auth
+    /// (KeyA si `key_ab`=0, KeyB sinon) → write. `true` seulement si le WRITE est ACK.
+    fn try_auth_write(
+        &mut self,
+        block: u8,
+        data: &[u8; 16],
+        uid4: &[u8; 4],
+        key_ab: u8,
+        key: &[u8; 6],
+    ) -> bool {
+        if !self.re_select() {
+            return false;
+        }
+        let cmd = if key_ab == 0 {
+            MIFARE_AUTH_A
+        } else {
+            MIFARE_AUTH_B
+        };
+        if self.mifare_auth(block, cmd, key, uid4).is_err() {
+            return false;
+        }
+        self.mifare_write_block(block, data).is_ok()
     }
 
     /// Clone un dump vers une carte gen1a via le backdoor 0x40/0x43 (le premier

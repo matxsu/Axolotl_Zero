@@ -566,7 +566,9 @@ where
                     while btn_dwn.is_low() {
                         FreeRtos::delay_ms(10);
                     }
-                    run_nfc_attacks(display, pn532, btn_up, btn_dwn, btn_mid, btn_lft)?;
+                    run_nfc_attacks(
+                        display, pn532, &found_keys, btn_up, btn_dwn, btn_mid, btn_lft,
+                    )?;
                     draw_post_dump_with_attack(display, readable_count, total, &acl, !can_clone)?;
                 }
                 FreeRtos::delay_ms(20);
@@ -589,7 +591,7 @@ where
 // bit-timing que le PN532 (I²C) ne permet pas → un Proxmark3 est requis. Le clone
 // teste déjà gen1a/gen2 tout seul (cf. clone_to_magic), donc plus besoin d'un test
 // "Magic?" séparé. Reste le wipe gen1a (utile sur carte magic réinscriptible).
-const ATTACK_ITEMS: &[&str; 2] = &["Wipe gen1a", "Retour"];
+const ATTACK_ITEMS: &[&str; 2] = &["Remettre a blanc", "Retour"];
 
 fn draw_attack_menu<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
 where
@@ -636,6 +638,7 @@ where
 fn run_nfc_attacks<D>(
     display: &mut D,
     pn532: &mut nfc::Pn532,
+    last_keys: &[nfc::attacks::SectorKey],
     btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
@@ -679,8 +682,9 @@ where
             }
             match sel {
                 0 => {
-                    // Wipe gen1a : efface tous les blocs via backdoor 0x40 sans auth.
-                    draw_nfc_status(display, "Wipe gen1a\nApproche magic...")?;
+                    // Remet la carte magic à blanc (transport state). gen1a via
+                    // backdoor, gen2/CUID via auth secteur par secteur.
+                    draw_nfc_status(display, "Remise a blanc\nApproche magic...")?;
                     if !pn532.re_select() {
                         draw_nfc_status(display, "Carte absente")?;
                         FreeRtos::delay_ms(2000);
@@ -688,17 +692,19 @@ where
                         continue;
                     }
                     let mut last_blk = 0u8;
-                    let (written, total) = pn532.wipe_gen1a(|blk, _status| {
+                    let (written, total) = pn532.wipe_to_blank(last_keys, |blk, _status| {
                         last_blk = blk;
                     });
-                    let msg = if written == total {
-                        format!("Wipe OK\n{}/{} blocs", written, total)
+                    let msg = if total == 0 {
+                        "Echec\nCarte non-magic ?".to_string()
+                    } else if written == total {
+                        format!("Carte vierge\n{}/{} blocs", written, total)
                     } else {
                         format!("Wipe partiel\n{}/{} blocs", written, total)
                     };
                     draw_nfc_status(display, &msg)?;
                     log::info!(
-                        "wipe_gen1a: {}/{} blocs effacés (dernier={}",
+                        "wipe_to_blank: {}/{} blocs effacés (dernier={})",
                         written,
                         total,
                         last_blk
