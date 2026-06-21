@@ -1030,8 +1030,9 @@ impl<'d> Pn532<'d> {
         }
         self.send_frame(CMD_TG_INIT_AS_TARGET, &params)?;
         self.read_ack()?;
-        // Attente avec timeout étendu : le lecteur peut mettre du temps
-        let resp = self.read_response_target(CMD_TG_INIT_AS_TARGET, 300)?;
+        // ~10 s d'attente : TgInitAsTarget ne répond que lorsqu'un lecteur active
+        // la cible. Laisse le temps d'approcher l'appareil du lecteur de porte.
+        let resp = self.read_response_target(CMD_TG_INIT_AS_TARGET, 1000)?;
         if resp.is_empty() {
             return Err(anyhow::anyhow!("TgInitAsTarget: echec"));
         }
@@ -1121,10 +1122,13 @@ impl<'d> Pn532<'d> {
             _ => (0x08u8, [0x04u8, 0x00u8]),
         };
 
-        if let Err(e) = self.tg_init_as_target(&uid4, sak, atqa) {
-            return EmulResult::Error(format!("{:?}", e));
+        // Pas de lecteur dans la fenêtre d'attente → Timeout propre ("pas de
+        // lecteur") plutôt qu'une erreur "PN532 timeout" qui n'aide pas l'user.
+        status("Approche lecteur...");
+        if self.tg_init_as_target(&uid4, sak, atqa).is_err() {
+            return EmulResult::Timeout;
         }
-        status("Pret — attente lecteur");
+        status("Lecteur detecte");
 
         let mut crypto: Option<(Crypto1, u32)> = None; // (state, auth_sector)
 
