@@ -51,7 +51,7 @@ impl ClassicType {
     /// - 1K/Mini : toujours 4 blocs.
     pub fn sector_block_count(self, sector: u8) -> u8 {
         match self {
-            Self::Classic4K if sector >= 32 && sector < 40 => 16,
+            Self::Classic4K if (32..40).contains(&sector) => 16,
             _ => 4,
         }
     }

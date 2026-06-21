@@ -75,8 +75,8 @@ impl AccessConditions {
         }
 
         let mut blocks = [BlockAccess::default(); 4];
-        for i in 0..4 {
-            blocks[i] = BlockAccess {
+        for (i, block) in blocks.iter_mut().enumerate() {
+            *block = BlockAccess {
                 c1: (c1 >> i) & 1 == 1,
                 c2: (c2 >> i) & 1 == 1,
                 c3: (c3 >> i) & 1 == 1,
