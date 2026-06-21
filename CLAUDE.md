@@ -88,12 +88,12 @@ axolotl-zero/                    Workspace Cargo (2 crates)
 | GPIO 11 | SPI MOSI | SPI | **Partagé display + SD + CC1101** |
 | GPIO 12 | SPI SCK | SPI | **Partagé display + SD + CC1101** |
 | GPIO 13 | SPI MISO | SPI | **Partagé SD + CC1101** (display write-only) |
-| GPIO 14 | CC1101 CS | SPI | Chip select Sub-GHz |
+| GPIO 14 | **Joystick CENTER** | GPIO (pull-up) | **MID** — déplacé de GPIO 21 (voir note) ; ⚠️ collision future avec CC1101 CS |
 | GPIO 15 | Joystick UP | GPIO (pull-up) | |
 | GPIO 16 | Joystick DOWN | GPIO (pull-up) | |
 | GPIO 17 | Joystick LEFT | GPIO (pull-up) | |
 | GPIO 18 | Joystick RIGHT | GPIO (pull-up) | |
-| GPIO 21 | Joystick CENTER | GPIO (pull-up) | |
+| ~~GPIO 21~~ | ❌ inutilisable | — | Tiré à LOW en permanence (LED RGB / court-circuit module) → MID déplacé sur GPIO 14 |
 | GPIO 38 | CC1101 GDO0 | GPIO IRQ | Sub-GHz interrupt |
 | GPIO 39 | CC1101 GDO2 | GPIO IRQ | Sub-GHz interrupt |
 | GPIO 46 | Display BLK | GPIO | Backlight |
@@ -102,6 +102,12 @@ axolotl-zero/                    Workspace Cargo (2 crates)
 > ⚠️ **Règle SPI** : un seul `SpiDriver` partagé avec plusieurs `SpiDeviceDriver`
 > (CS différents). NE PAS créer deux `SpiDriver` distincts sur les mêmes pins —
 > conflit matériel garanti.
+
+> ⚠️ **Bouton MID sur GPIO 14** : GPIO 21 (CENTER d'origine) est tiré à LOW en
+> permanence → jamais de front descendant → bouton inopérant. Le bouton a donc
+> été câblé sur GPIO 14 (`main.rs`). Mais GPIO 14 est aussi le **CC1101 CS**
+> théorique : avant de câbler le Sub-GHz, il FAUDRA réallouer un des deux
+> (déplacer le CC1101 CS sur une autre pin libre).
 
 ### Chaîne d'alimentation
 
