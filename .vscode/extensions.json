@@ -1,0 +1,11 @@
+﻿{
+    "recommendations": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "usernameheo.errorlens",
+        "eamodio.gitlens",
+        "serayuzgur.crates",
+        "gruntfuggly.todo-tree",
+        "ms-vscode.vscode-serial-monitor"
+    ]
+}
