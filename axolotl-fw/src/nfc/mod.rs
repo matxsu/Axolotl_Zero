@@ -7,8 +7,6 @@
 use esp_idf_hal::{delay::FreeRtos, delay::BLOCK, i2c::I2cDriver};
 
 pub mod attacks;
-pub mod darkside;
-pub mod nested;
 
 // Re-exports depuis axolotl-core pour que main.rs puisse écrire `nfc::NfcUid`
 // sans changer ses imports actuels.
@@ -25,21 +23,11 @@ const CMD_SAM_CONFIGURATION: u8 = 0x14;
 const CMD_IN_LIST_PASSIVE_TARGET: u8 = 0x4A;
 const CMD_IN_DATA_EXCHANGE: u8 = 0x40;
 const CMD_IN_COMMUNICATE_THRU: u8 = 0x42;
-const CMD_WRITE_REGISTER: u8 = 0x08;
 const CMD_IN_RELEASE: u8 = 0x52;
 const CMD_RF_CONFIGURATION: u8 = 0x32;
-
-// Registres CIU (Contactless Interface Unit) du PN532.
-// CIU_ManualRCV (0x630D) : bit 4 = ParityDisable
-const CIU_MANUAL_RCV_REG: u16 = 0x630D;
-// CIU_TxMode (0x6308) : bit 7 = TxCRCEn (1=CIU appende CRC en TX)
-#[allow(dead_code)] // réservé attaques bas-niveau (nested/darkside)
-const CIU_TX_MODE_REG: u16 = 0x6308;
-// CIU_RxMode (0x6309) : bit 7 = RxCRCEn (1=CIU vérifie CRC en RX)
-#[allow(dead_code)]
-const CIU_RX_MODE_REG: u16 = 0x6309;
-#[allow(dead_code)]
-const CMD_READ_REGISTER: u8 = 0x06;
+const CMD_TG_INIT_AS_TARGET: u8 = 0x8C;
+const CMD_TG_GET_DATA: u8 = 0x86;
+const CMD_TG_SET_DATA: u8 = 0x8E;
 
 // ── Framing ────────────────────────────────────────────────────────────────
 const PREAMBLE: u8 = 0x00;
@@ -216,50 +204,15 @@ impl<'d> Pn532<'d> {
         Ok(())
     }
 
-    // ── Primitives bas-niveau : InCommunicateThru / CRC-A / nonce brut ───
-
-    /// CRC-A ISO 14443-A (poly 0x1021, init 0x6363).
-    #[allow(dead_code)] // utilisé par les attaques bas-niveau (nested/darkside)
-    pub fn crc_a(data: &[u8]) -> [u8; 2] {
-        let mut crc: u16 = 0x6363;
-        for &byte in data {
-            let ch = byte ^ (crc as u8);
-            let ch = ch ^ (ch << 4);
-            crc = (crc >> 8)
-                ^ ((ch as u16) << 8)
-                ^ ((ch as u16) << 3)
-                ^ ((ch as u16) >> 4);
-        }
-        [(crc & 0xFF) as u8, (crc >> 8) as u8]
-    }
-
-    /// Envoie des octets bruts à la cible (InCommunicateThru 0x42).
-    /// Le PN532 n'applique pas de couche Crypto1 — les bytes sont relayés tels quels.
-    /// Retourne les bytes reçus de la carte (status byte exclu).
-    pub fn in_communicate_thru(&mut self, data: &[u8]) -> anyhow::Result<heapless::Vec<u8, 32>> {
-        // InCommunicateThru reçoit le data sans Tg (le PN532 l'ajoute lui-même).
-        self.send_frame(CMD_IN_COMMUNICATE_THRU, data)?;
-        self.read_ack()?;
-        let resp = self.read_response(CMD_IN_COMMUNICATE_THRU)?;
-        // Premier byte = status : 0x00 = succès, autres = erreur RF.
-        if resp.is_empty() {
-            return Err(anyhow::anyhow!("InCommunicateThru: réponse vide"));
-        }
-        let status = resp[0];
-        // 0x01 = timeout (carte HALT), on le tolère pour certaines probes.
-        if status != 0x00 && status != 0x01 {
-            return Err(anyhow::anyhow!("InCommunicateThru status={:#02x}", status));
-        }
-        let mut result: heapless::Vec<u8, 32> = heapless::Vec::new();
-        for &b in resp.iter().skip(1) {
-            result.push(b).ok();
-        }
-        Ok(result)
-    }
+    // ── Primitive bas-niveau : InCommunicateThru (relayé sans couche Crypto1) ──
+    // Utilisée par le clone / wipe gen1a pour dialoguer avec la backdoor magic.
 
     /// Variante qui tolère tous les status codes et retourne (status, data).
     /// Nécessaire pour détecter les cartes magic (réponse ACK 4-bit → CRC error).
-    fn in_communicate_thru_relaxed(&mut self, data: &[u8]) -> anyhow::Result<(u8, heapless::Vec<u8, 32>)> {
+    fn in_communicate_thru_relaxed(
+        &mut self,
+        data: &[u8],
+    ) -> anyhow::Result<(u8, heapless::Vec<u8, 32>)> {
         self.send_frame(CMD_IN_COMMUNICATE_THRU, data)?;
         self.read_ack()?;
         let resp = self.read_response(CMD_IN_COMMUNICATE_THRU)?;
@@ -272,87 +225,6 @@ impl<'d> Pn532<'d> {
             result.push(b).ok();
         }
         Ok((status, result))
-    }
-
-    /// Lit un registre CIU via ReadRegister (cmd 0x06).
-    #[allow(dead_code)] // utilisé par les attaques bas-niveau (nested/darkside)
-    fn read_register(&mut self, addr: u16) -> u8 {
-        let hi = (addr >> 8) as u8;
-        let lo = (addr & 0xFF) as u8;
-        if self.send_frame(CMD_READ_REGISTER, &[hi, lo]).is_err() {
-            return 0;
-        }
-        if self.read_ack().is_err() {
-            return 0;
-        }
-        match self.read_response(CMD_READ_REGISTER) {
-            Ok(r) => r.first().copied().unwrap_or(0),
-            Err(_) => 0,
-        }
-    }
-
-    /// Écrit un registre CIU via WriteRegister (cmd 0x08).
-    #[allow(dead_code)] // utilisé par les attaques bas-niveau (nested/darkside)
-    fn write_register_raw(&mut self, addr: u16, val: u8) {
-        let hi = (addr >> 8) as u8;
-        let lo = (addr & 0xFF) as u8;
-        let _ = self.send_frame(CMD_WRITE_REGISTER, &[hi, lo, val]);
-        let _ = self.read_ack();
-        let _ = self.read_response(CMD_WRITE_REGISTER);
-    }
-
-    /// Tente de désactiver la vérification automatique de parité dans le PN532
-    /// (registre CIU_ManualRCV, bit4=ParityDisable).
-    /// Certains clones IC=0x32 ignorent cette commande — on vérifie en retour.
-    /// Retourne `true` si la commande WriteRegister a été acceptée.
-    pub fn try_disable_parity(&mut self) -> bool {
-        let reg_hi = (CIU_MANUAL_RCV_REG >> 8) as u8;
-        let reg_lo = (CIU_MANUAL_RCV_REG & 0xFF) as u8;
-        // bit 4 = ParityDisable, bit 5 = TxMix (ne pas toucher) — on met juste bit4.
-        let params = [reg_hi, reg_lo, 0x10u8];
-        if self.send_frame(CMD_WRITE_REGISTER, &params).is_err() {
-            return false;
-        }
-        if self.read_ack().is_err() {
-            return false;
-        }
-        self.read_response(CMD_WRITE_REGISTER).is_ok()
-    }
-
-    /// Capture le nonce brut NT via InCommunicateThru (sans finaliser l'auth).
-    ///
-    /// Après InListPassiveTarget, le CIU est en mode MIFARE Type A 106kbps :
-    /// - TX CRCEn = 1 → le CIU appende automatiquement CRC-A à la commande
-    /// - RX CRCEn = 1 → le CIU vérifie et stripe le CRC de la réponse NT
-    ///
-    /// Il ne faut donc PAS inclure de CRC manuel — sinon double CRC → carte rejette.
-    /// La carte répond toujours au challenge NT même si le secteur est verrouillé.
-    pub fn read_raw_nonce(&mut self, block: u8) -> anyhow::Result<[u8; 4]> {
-        // Commande d'auth sans CRC — le CIU ajoute le CRC automatiquement.
-        let frame = [MIFARE_AUTH_A, block];
-        let resp = self.in_communicate_thru(&frame)?;
-        // Le CIU a stripé le CRC de la réponse → on attend 4 bytes NT en clair.
-        if resp.len() < 4 {
-            return Err(anyhow::anyhow!("NT trop court ({} bytes)", resp.len()));
-        }
-        log::info!("NT raw: {:02X} {:02X} {:02X} {:02X}", resp[0], resp[1], resp[2], resp[3]);
-        Ok([resp[0], resp[1], resp[2], resp[3]])
-    }
-
-    /// Envoie un AR (reader response) bogus après un read_raw_nonce et retourne
-    /// le NACK chiffré de la carte (1 byte). Les 4 bits hauts du NACK sont ks4.
-    /// NACK valeur attendue = 0x5 (0101) → ks4 = nack_enc XOR 0x5.
-    pub fn send_bogus_ar_get_nack(&mut self, bogus_nr: [u8; 4], bogus_ar: [u8; 4]) -> anyhow::Result<u8> {
-        // Envoie nr (4 bytes) + ar (4 bytes) en une seule trame.
-        let frame = [
-            bogus_nr[0], bogus_nr[1], bogus_nr[2], bogus_nr[3],
-            bogus_ar[0], bogus_ar[1], bogus_ar[2], bogus_ar[3],
-        ];
-        let resp = self.in_communicate_thru(&frame)?;
-        if resp.is_empty() {
-            return Err(anyhow::anyhow!("NACK: réponse vide (timeout ?)"));
-        }
-        Ok(resp[0])
     }
 
     // ── API publique — scan ───────────────────────────────────────────────
@@ -496,14 +368,16 @@ impl<'d> Pn532<'d> {
         self.in_release();
 
         // RF OFF : 100ms suffisent pour vider le condensateur (~50ms typique).
-        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x01, 0x00]);
+        let params = [0x01u8, 0x00u8];
+        let _ = self.send_frame(CMD_RF_CONFIGURATION, &params);
         let _ = self.read_ack();
         let _ = self.read_response(CMD_RF_CONFIGURATION);
 
         FreeRtos::delay_ms(100);
 
         // RF ON
-        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x01, 0x02]);
+        let params = [0x01u8, 0x02u8];
+        let _ = self.send_frame(CMD_RF_CONFIGURATION, &params);
         let _ = self.read_ack();
         let _ = self.read_response(CMD_RF_CONFIGURATION);
 
@@ -533,82 +407,22 @@ impl<'d> Pn532<'d> {
     /// c'est le signal, pas une invitation à empiler des commandes ailleurs.
     pub fn recover(&mut self) {
         log::warn!("PN532 recover: re-init apres erreur de comm");
-        for _ in 0..6 {
+        // Vider agressivement le bus I2C de tout octet bloqué
+        for _ in 0..10 {
+            // Augmenté à 10 passages
             let mut buf = [0u8; 32];
+            // On ignore silencieusement les erreurs de lecture ici
             let _ = self.i2c.read(PN532_ADDR, &mut buf, BLOCK);
-            FreeRtos::delay_ms(5);
+            FreeRtos::delay_ms(10);
         }
-        FreeRtos::delay_ms(20);
+
+        // Relance d'un cycle RF forcé pour réinitialiser la carte cible
+        self.rf_cycle();
+
         let _ = self.sam_configuration();
         let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x05, 0xFF, 0x01, 0x02]);
         let _ = self.read_ack();
         let _ = self.read_response(CMD_RF_CONFIGURATION);
-    }
-
-    // ── API publique — restore MIFARE ────────────────────────────────────
-
-    /// Écrit un dump complet sur la carte cible (clone).
-    /// - Saute le bloc 0 (UID/fabricant, read-only sur cartes standard).
-    /// - Saute les sector trailers (blocs 3, 7, 11, ... 63) pour ne pas
-    ///   écraser les clés et access bits de la carte cible.
-    /// - `on_sector(sector)` : callback de progression (0..15).
-    /// Retourne le nombre de blocs écrits avec succès.
-    #[allow(dead_code)] // restore vers carte cible standard — gardé pour usage futur
-    pub fn mifare_restore<F: FnMut(u8, u8)>(
-        &mut self,
-        uid: &NfcUid,
-        dump: &MifareDump,
-        mut on_sector: F,
-    ) -> anyhow::Result<u32> {
-        let uid4 = [uid.bytes[0], uid.bytes[1], uid.bytes[2], uid.bytes[3]];
-        let mut written = 0u32;
-        let card_type = dump.card_type;
-        let total = card_type.sector_count();
-
-        for sector in 0..total {
-            on_sector(sector, total);
-            let trailer = match card_type.sector_trailer(sector) {
-                Some(t) => t,
-                None => break,
-            };
-            let first = card_type.sector_first_block(sector).unwrap();
-            let block_count = card_type.sector_block_count(sector);
-
-            // Authentification avec la clé A du dump (sector trailer bloc)
-            let key_a: [u8; 6] = dump.blocks[trailer as usize][0..6]
-                .try_into()
-                .unwrap_or([0xFF; 6]);
-
-            if self.mifare_auth(trailer, MIFARE_AUTH_A, &key_a, &uid4).is_err() {
-                log::warn!("Restore secteur {:02}: auth echouee", sector);
-                if !self.re_select() {
-                    return Err(anyhow::anyhow!("carte perdue au secteur {}", sector));
-                }
-                continue;
-            }
-
-            // Écrit tous les blocs du secteur SAUF le trailer (préserve clés cible)
-            for i in 0..(block_count - 1) {
-                let block = first + i;
-                let idx = block as usize;
-                // Bloc 0 = UID/fabricant, read-only sur cartes standard
-                if block == 0 {
-                    continue;
-                }
-                if !dump.readable[idx] {
-                    continue;
-                }
-                match self.mifare_write_block(block, &dump.blocks[idx]) {
-                    Ok(_) => written += 1,
-                    Err(e) => log::warn!("Restore bloc {:02}: {:?}", block, e),
-                }
-            }
-
-            self.re_select();
-        }
-
-        log::info!("Restore termine : {} blocs ecrits", written);
-        Ok(written)
     }
 
     // ── API publique — clone vers carte magic ─────────────────────────────
@@ -635,7 +449,11 @@ impl<'d> Pn532<'d> {
         // KeyB : clé trouvée → sinon KeyB lisible du dump (secteurs FF) → sinon KeyA.
         let key_b = find(1).unwrap_or_else(|| {
             let kb: [u8; 6] = orig[10..16].try_into().unwrap_or([0xFF; 6]);
-            if kb != [0u8; 6] { kb } else { key_a }
+            if kb != [0u8; 6] {
+                kb
+            } else {
+                key_a
+            }
         });
         let (acc, gpb) = if reversible {
             ([0xFFu8, 0x07, 0x80], 0x69u8)
@@ -692,7 +510,11 @@ impl<'d> Pn532<'d> {
             Ok(Some(u)) => {
                 log::info!(
                     "Clone cible UID : {:02X}:{:02X}:{:02X}:{:02X}  SAK={:#04X}",
-                    u.bytes[0], u.bytes[1], u.bytes[2], u.bytes[3], u.sak
+                    u.bytes[0],
+                    u.bytes[1],
+                    u.bytes[2],
+                    u.bytes[3],
+                    u.sak
                 );
                 let uid4 = [u.bytes[0], u.bytes[1], u.bytes[2], u.bytes[3]];
                 for cand in [[0xFFu8; 6], key_a0] {
@@ -710,19 +532,25 @@ impl<'d> Pn532<'d> {
                     self.re_select();
                 }
                 if !block0_writable {
-                    log::warn!("Test gen2 : auth/write bloc 0 KO (cible non-magic ou cles inconnues)");
+                    log::warn!(
+                        "Test gen2 : auth/write bloc 0 KO (cible non-magic ou cles inconnues)"
+                    );
                 }
             }
             _ => log::warn!("Clone : aucune carte cible au demarrage"),
         }
         self.re_select();
 
-        // Abandon AVANT toute écriture si la cible n'est pas magic.
-        // TODO(nfc): support gen1a — bloc 0 via backdoor 0x40 (7-bit framing),
-        // pas par WRITE normal. clone_to_magic gère gen2/CUID uniquement ;
-        // router les gen1a vers un clone_gen1a basé sur wipe_gen1a (WIP).
         if !block0_writable {
-            log::warn!("Clone ANNULE : cible non-magic (bloc 0 non reinscriptible) — rien ecrit");
+            // Fallback gen1a : 0x40 → ACK 0x0A = backdoor disponible.
+            // Après re_select (ligne précédente), la carte est en état ACTIVE.
+            log::info!("Clone gen2 KO — test backdoor gen1a (0x40)");
+            let ack40 = self.in_communicate_thru_relaxed(&[0x40]);
+            if matches!(ack40, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+                log::info!("Clone : ACK gen1a recu — clone gen1a en cours");
+                return self.clone_gen1a_unlocked(dump, keys, reversible, on_sector);
+            }
+            log::warn!("Clone ANNULE : cible non-magic (ni gen2 ni gen1a) — rien ecrit");
             self.reset_field();
             return Err(anyhow::anyhow!("cible non-magic (bloc 0 verrouille)"));
         }
@@ -752,19 +580,30 @@ impl<'d> Pn532<'d> {
                     }
                 }
             };
-            let uid4 = [cur_uid.bytes[0], cur_uid.bytes[1], cur_uid.bytes[2], cur_uid.bytes[3]];
+            let uid4 = [
+                cur_uid.bytes[0],
+                cur_uid.bytes[1],
+                cur_uid.bytes[2],
+                cur_uid.bytes[3],
+            ];
 
             // Auth cible : FF (vierge) puis KeyA reconstruite (re-clone d'une carte déjà clonée).
             let mut authed = false;
             for cand in [[0xFFu8; 6], key_a] {
-                if self.mifare_auth(trailer, MIFARE_AUTH_A, &cand, &uid4).is_ok() {
+                if self
+                    .mifare_auth(trailer, MIFARE_AUTH_A, &cand, &uid4)
+                    .is_ok()
+                {
                     authed = true;
                     break;
                 }
                 self.re_select();
             }
             if !authed {
-                log::warn!("Clone secteur {:02}: auth cible echouee (FF + KeyA)", sector);
+                log::warn!(
+                    "Clone secteur {:02}: auth cible echouee (FF + KeyA)",
+                    sector
+                );
                 self.re_select();
                 continue;
             }
@@ -828,7 +667,10 @@ impl<'d> Pn532<'d> {
         if let Ok(Some(u)) = self.read_uid() {
             log::info!(
                 "Read-back UID carte clonee : {:02X}:{:02X}:{:02X}:{:02X}",
-                u.bytes[0], u.bytes[1], u.bytes[2], u.bytes[3]
+                u.bytes[0],
+                u.bytes[1],
+                u.bytes[2],
+                u.bytes[3]
             );
         }
 
@@ -862,52 +704,6 @@ impl<'d> Pn532<'d> {
         Ok((dump, keys))
     }
 
-    /// Tente de détecter une carte gen1a ("magic backdoor").
-    ///
-    /// Envoie 0x40 en byte complet (pas de manipulation CIU_BitFraming — le registre
-    /// 0x6306 reste à 0 pour éviter de casser les transmissions suivantes).
-    /// Les cartes gen1a répondent ACK=0x0A ; les vraies NXP et gen2 ignorent (timeout).
-    ///
-    /// Après la probe, fait un RF cycle + SAMConfiguration pour garantir un état PN532
-    /// propre — sans ça, l'InCommunicateThru laisse le PN532 dans un état qui empêche
-    /// les InAuthenticate suivantes (auth FFFFFFFFFFFF échoue même sur carte vierge).
-    pub fn detect_magic_gen1a(&mut self) -> bool {
-        let result = self.in_communicate_thru_relaxed(&[0x40]);
-
-        let is_magic = match result {
-            Ok((status, ref resp)) => {
-                (status == 0x00 || status == 0x02) && resp.first() == Some(&0x0A)
-            }
-            Err(_) => false,
-        };
-
-        if is_magic {
-            log::info!("MAGIC GEN1A detectee — carte UID-modifiable");
-            let _ = self.in_communicate_thru_relaxed(&[0x43]);
-        }
-
-        // Reset PN532 : RF cycle + SAMConfig pour revenir à un état propre.
-        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x01, 0x00]);
-        let _ = self.read_ack();
-        let _ = self.read_response(CMD_RF_CONFIGURATION);
-        FreeRtos::delay_ms(120);
-        let _ = self.send_frame(CMD_RF_CONFIGURATION, &[0x01, 0x02]);
-        let _ = self.read_ack();
-        let _ = self.read_response(CMD_RF_CONFIGURATION);
-        FreeRtos::delay_ms(80);
-        let _ = self.sam_configuration();
-        FreeRtos::delay_ms(50);
-
-        // Re-sélectionne la carte pour les opérations suivantes.
-        for _ in 0..10 {
-            if matches!(self.read_uid(), Ok(Some(_))) {
-                return is_magic;
-            }
-            FreeRtos::delay_ms(50);
-        }
-        is_magic
-    }
-
     /// Wipe gen1a : efface tous les blocs via le backdoor 0x40 sans auth.
     ///
     /// Séquence : 0x40 → ACK 0x0A, 0x43 → ACK 0x0A, puis WRITE (0xA0)
@@ -936,7 +732,7 @@ impl<'d> Pn532<'d> {
 
         const TRANSPORT_TRAILER: [u8; 16] = [
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyA
-            0xFF, 0x07, 0x80, 0x69,             // Access bits transport
+            0xFF, 0x07, 0x80, 0x69, // Access bits transport
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // KeyB
         ];
         const ZERO_BLOCK: [u8; 16] = [0u8; 16];
@@ -945,7 +741,11 @@ impl<'d> Pn532<'d> {
         // Blocs 1..63 (bloc 0 = UID, on ne touche pas)
         for blk in 1u8..64 {
             let is_trailer = (blk % 4) == 3;
-            let data = if is_trailer { &TRANSPORT_TRAILER } else { &ZERO_BLOCK };
+            let data = if is_trailer {
+                &TRANSPORT_TRAILER
+            } else {
+                &ZERO_BLOCK
+            };
 
             // WRITE : 0xA0 + bloc, puis 16 bytes data
             // Le CIU ajoute CRC-A automatiquement sur chaque trame.
@@ -973,6 +773,87 @@ impl<'d> Pn532<'d> {
         self.reset_field();
         log::info!("wipe_gen1a: {}/63 blocs effacés", written);
         (written, 63)
+    }
+
+    /// Clone un dump vers une carte gen1a via le backdoor 0x40/0x43 (le premier
+    /// octet 0x40 a déjà été envoyé et a reçu ACK 0x0A par l'appelant).
+    ///
+    /// Le backdoor bypass l'authentification MIFARE → tous les blocs (y compris
+    /// le bloc 0 / UID) sont accessibles en écriture directe via WRITE (0xA0).
+    fn clone_gen1a_unlocked<F: FnMut(u8, u8)>(
+        &mut self,
+        dump: &MifareDump,
+        keys: &[attacks::SectorKey],
+        reversible: bool,
+        mut on_sector: F,
+    ) -> anyhow::Result<(u32, bool)> {
+        // Finalise le backdoor (0x40 était déjà envoyé et ACK'd).
+        let ack43 = self.in_communicate_thru_relaxed(&[0x43]);
+        if !matches!(ack43, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+            log::warn!("clone_gen1a: 0x43 ACK manquant");
+            self.reset_field();
+            return Err(anyhow::anyhow!("gen1a backdoor: pas d'ACK sur 0x43"));
+        }
+        log::info!(
+            "clone_gen1a: backdoor ouvert — {} blocs a ecrire",
+            dump.card_type.block_count()
+        );
+
+        let total_blocks = dump.card_type.block_count() as u8;
+        let total_sectors = dump.card_type.sector_count();
+        let mut written = 0u32;
+        let mut block0_written = false;
+        let mut last_sector_notified = u8::MAX;
+
+        for blk in 0u8..total_blocks {
+            let sector = block_to_sector(dump.card_type, blk);
+            if sector != last_sector_notified {
+                on_sector(sector, total_sectors);
+                last_sector_notified = sector;
+            }
+
+            let data: [u8; 16] = if dump.card_type.is_trailer(blk as usize) {
+                Self::reconstruct_trailer(sector, dump, keys, reversible)
+            } else {
+                dump.blocks[blk as usize]
+            };
+
+            // WRITE : 0xA0 + bloc, puis 16 bytes. CRC-A ajouté par le CIU.
+            let cmd_write = [0xA0u8, blk];
+            let ack1 = self.in_communicate_thru_relaxed(&cmd_write);
+            if !matches!(ack1, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+                log::warn!("clone_gen1a blk{:03}: WRITE cmd ACK rate", blk);
+                continue;
+            }
+            let ack2 = self.in_communicate_thru_relaxed(&data);
+            if matches!(ack2, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+                written += 1;
+                if blk == 0 {
+                    block0_written = true;
+                }
+            } else {
+                log::warn!("clone_gen1a blk{:03}: data ACK rate", blk);
+            }
+        }
+
+        self.reset_field();
+        FreeRtos::delay_ms(100);
+        if let Ok(Some(u)) = self.read_uid() {
+            log::info!(
+                "clone_gen1a read-back UID: {:02X}:{:02X}:{:02X}:{:02X}",
+                u.bytes[0],
+                u.bytes[1],
+                u.bytes[2],
+                u.bytes[3]
+            );
+        }
+        log::info!(
+            "clone_gen1a: {}/{} blocs ecrits, bloc0={}",
+            written,
+            total_blocks,
+            block0_written
+        );
+        Ok((written, block0_written))
     }
 
     // ── API publique — Ultralight / NTAG ─────────────────────────────────
@@ -1103,41 +984,317 @@ impl<'d> Pn532<'d> {
         log::info!("NTAG: {} pages ({} bytes) lus", total_pages, data.len());
         Ok(data)
     }
-
-    // ── API publique — Attaques cryptographiques MIFARE ───────────────────
-
-    /// Probe Darkside : collecte des nonces bruts, détecte le type de PRNG.
-    /// Résultat loggé en détail dans le moniteur.
-    pub fn darkside_probe(&mut self, uid: &NfcUid) -> darkside::DarksideProbe {
-        darkside::probe(self, uid)
-    }
-
-    /// Attaque Darkside complète. Ne fonctionne que si probe_prng() retourne PrngType::Fixed.
-    /// `on_progress(attempt, total)` : callback de progression.
-    pub fn darkside_attack<F: FnMut(u32, u32)>(
-        &mut self,
-        uid: &NfcUid,
-        fixed_nt: u32,
-        on_progress: F,
-    ) -> Option<[u8; 6]> {
-        darkside::run_attack(self, uid, fixed_nt, on_progress)
-    }
-
-    /// Collecte de nonces nichés pour l'attaque Nested (style MFOC).
-    /// Nécessite une clé connue pour au moins un secteur.
-    pub fn nested_collect(
-        &mut self,
-        uid: &NfcUid,
-        known_sector: u8,
-        known_key: [u8; 6],
-        target_sector: u8,
-        samples: u8,
-    ) -> nested::NestedResult {
-        nested::collect_nested_nonces(self, uid, known_sector, known_key, target_sector, samples)
-    }
 }
 
 // ── Helpers de logging — print_log restait dans le firmware (log crate) ────
+
+// ── Émulation badge MIFARE Classic ────────────────────────────────────────
+
+/// Résultat de la session d'émulation.
+pub enum EmulResult {
+    /// Session terminée proprement (lecteur s'est déconnecté).
+    Done,
+    /// Timeout : aucun lecteur détecté pendant la fenêtre d'attente.
+    Timeout,
+    /// Erreur matérielle PN532.
+    Error(String),
+}
+
+impl<'d> Pn532<'d> {
+    /// Configure le PN532 en mode cible passif 106kbps ISO14443-A.
+    /// Le PN532 répondra automatiquement aux REQA/WUPA et aux anticollisions.
+    /// Après SELECT, toutes les commandes arrivent via `tg_get_data`.
+    ///
+    /// ATQA pour MIFARE Classic 1K = [0x04, 0x00], SAK = 0x08.
+    /// ATQA pour MIFARE Classic 4K = [0x02, 0x00], SAK = 0x18.
+    pub fn tg_init_as_target(
+        &mut self,
+        uid4: &[u8; 4],
+        sak: u8,
+        atqa: [u8; 2],
+    ) -> anyhow::Result<()> {
+        // TgInitAsTarget : mode=0x00 (passif), MifareParams, FelicaParams (zeros), Nfcid3t (zeros)
+        let mut params: heapless::Vec<u8, 48> = heapless::Vec::new();
+        params.push(0x00).ok(); // Mode: passif
+        params.push(atqa[0]).ok(); // ATQA byte 0
+        params.push(atqa[1]).ok(); // ATQA byte 1
+        params.push(sak).ok(); // SAK
+        params.push(4u8).ok(); // NFCIDLength = 4 bytes
+        params.push(uid4[0]).ok();
+        params.push(uid4[1]).ok();
+        params.push(uid4[2]).ok();
+        params.push(uid4[3]).ok();
+        // FelicaParams (18 bytes, non utilisés) + Nfcid3t (10 bytes)
+        for _ in 0..28 {
+            params.push(0x00).ok();
+        }
+        self.send_frame(CMD_TG_INIT_AS_TARGET, &params)?;
+        self.read_ack()?;
+        // Attente avec timeout étendu : le lecteur peut mettre du temps
+        let resp = self.read_response_target(CMD_TG_INIT_AS_TARGET, 300)?;
+        if resp.is_empty() {
+            return Err(anyhow::anyhow!("TgInitAsTarget: echec"));
+        }
+        Ok(())
+    }
+
+    /// Attend une commande du lecteur (timeout 5 s par défaut).
+    /// Le PN532 strip le CRC-A avant de retourner les données.
+    pub fn tg_get_data(&mut self) -> anyhow::Result<heapless::Vec<u8, 32>> {
+        self.send_frame(CMD_TG_GET_DATA, &[])?;
+        self.read_ack()?;
+        let resp = self.read_response_target(CMD_TG_GET_DATA, 500)?;
+        if resp.first().copied().unwrap_or(1) != 0x00 {
+            return Err(anyhow::anyhow!(
+                "TgGetData: status {:02X}",
+                resp.first().copied().unwrap_or(0xFF)
+            ));
+        }
+        let mut data: heapless::Vec<u8, 32> = heapless::Vec::new();
+        for &b in resp.iter().skip(1) {
+            data.push(b).ok();
+        }
+        Ok(data)
+    }
+
+    /// Envoie une réponse au lecteur. Le PN532 append le CRC-A automatiquement.
+    pub fn tg_set_data(&mut self, data: &[u8]) -> anyhow::Result<()> {
+        self.send_frame(CMD_TG_SET_DATA, data)?;
+        self.read_ack()?;
+        let resp = self.read_response(CMD_TG_SET_DATA)?;
+        if resp.first().copied().unwrap_or(1) != 0x00 {
+            return Err(anyhow::anyhow!("TgSetData: erreur"));
+        }
+        Ok(())
+    }
+
+    /// Variante de read_response avec timeout étendu (N × 10ms).
+    fn read_response_target(
+        &mut self,
+        cmd: u8,
+        max_tries: u32,
+    ) -> anyhow::Result<heapless::Vec<u8, 32>> {
+        self.wait_ready(max_tries)?;
+        let mut buf = [0u8; 32];
+        self.i2c
+            .read(PN532_ADDR, &mut buf, BLOCK)
+            .map_err(|e| anyhow::anyhow!("PN532 read: {:?}", e))?;
+        if buf[6] != TFI_C2H {
+            return Err(anyhow::anyhow!("TFI inattendu: {:#02x}", buf[6]));
+        }
+        if buf[7] != cmd.wrapping_add(1) {
+            return Err(anyhow::anyhow!("CMD inattendue: {:#02x}", buf[7]));
+        }
+        let len = buf[4] as usize;
+        let end = (8 + len.saturating_sub(2)).min(32);
+        let mut result: heapless::Vec<u8, 32> = heapless::Vec::new();
+        for i in 8..end {
+            result.push(buf[i]).ok();
+        }
+        Ok(result)
+    }
+
+    /// Émule un badge MIFARE Classic à partir d'un dump.
+    ///
+    /// ## Protocole Crypto1 implémenté :
+    /// - AUTH: génère NT aléatoire, vérifie AR du lecteur, envoie AT
+    /// - READ: déchiffre la commande, envoie le bloc du dump chiffré
+    /// - Autres commandes: NACK chiffré, reset de la session
+    ///
+    /// Le PN532 gère anticollision/SELECT/CRC automatiquement en mode cible.
+    /// On gère Crypto1 côté ESP32 (le PN532 passe les octets bruts chiffrés).
+    pub fn emulate_mifare<F: FnMut(&str)>(
+        &mut self,
+        dump: &MifareDump,
+        keys: &[attacks::SectorKey],
+        mut status: F,
+    ) -> EmulResult {
+        use axolotl_core::crypto1::Crypto1;
+
+        // UID depuis bloc 0
+        let b0 = dump.blocks[0];
+        let uid4 = [b0[0], b0[1], b0[2], b0[3]];
+        let uid32 = u32::from_be_bytes(uid4);
+        let (sak, atqa) = match dump.card_type {
+            ClassicType::Classic4K => (0x18u8, [0x02u8, 0x00u8]),
+            ClassicType::Mini => (0x09u8, [0x04u8, 0x00u8]),
+            _ => (0x08u8, [0x04u8, 0x00u8]),
+        };
+
+        if let Err(e) = self.tg_init_as_target(&uid4, sak, atqa) {
+            return EmulResult::Error(format!("{:?}", e));
+        }
+        status("Pret — attente lecteur");
+
+        let mut crypto: Option<(Crypto1, u32)> = None; // (state, auth_sector)
+
+        loop {
+            let frame = match self.tg_get_data() {
+                Ok(f) => f,
+                Err(_) => return EmulResult::Timeout,
+            };
+
+            if frame.is_empty() {
+                continue;
+            }
+
+            // Décrypter si une session Crypto1 est active
+            let cmd_byte = if let Some((ref mut s, _)) = crypto {
+                frame[0] ^ s.keystream_byte()
+            } else {
+                frame[0]
+            };
+
+            match cmd_byte {
+                // ── Authentification ───────────────────────────────────────
+                0x60 | 0x61 => {
+                    let key_ab: u8 = if cmd_byte == 0x60 { 0 } else { 1 };
+                    // Pour nested auth, le bloc est chiffré — on le déchiffre avant de reset.
+                    // (Pour le premier auth, crypto=None donc raw_block est en clair.)
+                    let raw_block = frame.get(1).copied().unwrap_or(0);
+                    let block = if let Some((ref mut s, _)) = crypto.as_mut() {
+                        raw_block ^ s.keystream_byte()
+                    } else {
+                        raw_block
+                    };
+                    crypto = None; // reset après décryptage du numéro de bloc
+                                   // Numéro de secteur depuis le numéro de bloc
+                    let sector = block_to_sector(dump.card_type, block);
+
+                    // Cherche la clé pour ce secteur
+                    let key = keys
+                        .iter()
+                        .find(|k| k.sector == sector && k.key_ab == key_ab)
+                        .map(|k| k.key)
+                        .or_else(|| {
+                            let t = dump.card_type.sector_trailer(sector)? as usize;
+                            let slice = if key_ab == 0 {
+                                &dump.blocks[t][0..6]
+                            } else {
+                                &dump.blocks[t][10..16]
+                            };
+                            slice.try_into().ok()
+                        });
+
+                    let key = match key {
+                        Some(k) => k,
+                        None => {
+                            let _ = self.tg_set_data(&[0x05]); // NACK
+                            status("Auth: cle manquante");
+                            continue;
+                        }
+                    };
+
+                    // NT aléatoire via timer µs (pas besoin de vraie RNG, juste unique)
+                    let nt32 =
+                        unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u32 ^ 0xA5F0_1234;
+                    let nt_bytes = nt32.to_be_bytes();
+
+                    if self.tg_set_data(&nt_bytes).is_err() {
+                        return EmulResult::Error("envoi NT".into());
+                    }
+
+                    // Reçoit {NR_enc, AR_enc} (8 bytes)
+                    let nr_ar = match self.tg_get_data() {
+                        Ok(d) => d,
+                        Err(_) => return EmulResult::Timeout,
+                    };
+                    if nr_ar.len() < 8 {
+                        let _ = self.tg_set_data(&[0x05]);
+                        continue;
+                    }
+
+                    let key64 =
+                        u64::from_be_bytes([0, 0, key[0], key[1], key[2], key[3], key[4], key[5]]);
+                    let mut s = Crypto1::init_auth(key64, uid32, nt32);
+
+                    let ks1 = s.keystream_word();
+                    let nr_enc = u32::from_be_bytes([nr_ar[0], nr_ar[1], nr_ar[2], nr_ar[3]]);
+                    let nr = nr_enc ^ ks1;
+                    s.word_in(nr, false); // avance l'état avec NR réel
+
+                    let ks2 = s.keystream_word();
+                    let ar_enc = u32::from_be_bytes([nr_ar[4], nr_ar[5], nr_ar[6], nr_ar[7]]);
+                    let ar_plain = ar_enc ^ ks2;
+
+                    // AR attendu = ROL(NT, 1)
+                    if ar_plain != nt32.rotate_left(1) {
+                        let _ = self.tg_set_data(&[0x05]);
+                        status("Auth: AR incorrect");
+                        continue;
+                    }
+
+                    // AT = ROL(NT, 2), chiffré avec ks3
+                    let ks3 = s.keystream_word();
+                    let at_enc = (nt32.rotate_left(2) ^ ks3).to_be_bytes();
+                    if self.tg_set_data(&at_enc).is_err() {
+                        return EmulResult::Error("envoi AT".into());
+                    }
+
+                    crypto = Some((s, sector as u32));
+                    let msg = format!("Auth OK S{}", sector);
+                    status(&msg);
+                }
+
+                // ── Lecture ────────────────────────────────────────────────
+                MIFARE_READ => {
+                    let (s, _sec) = match crypto.as_mut() {
+                        Some(c) => c,
+                        None => {
+                            let _ = self.tg_set_data(&[0x05]);
+                            continue;
+                        }
+                    };
+                    // Décrypter le numéro de bloc (déjà décrypté via cmd_byte ci-dessus)
+                    let block = frame.get(1).copied().unwrap_or(0) ^ s.keystream_byte();
+                    let block_usize = block as usize;
+
+                    let block_data = if block_usize < dump.blocks.len() {
+                        dump.blocks[block_usize]
+                    } else {
+                        [0u8; 16]
+                    };
+
+                    // Chiffrer les 16 bytes de réponse avec le keystream courant
+                    let mut enc = [0u8; 16];
+                    for (i, b) in block_data.iter().enumerate() {
+                        enc[i] = b ^ s.keystream_byte();
+                    }
+                    if self.tg_set_data(&enc).is_err() {
+                        return EmulResult::Error("envoi READ".into());
+                    }
+                }
+
+                // ── Écriture (ignorée — badge en lecture seule) ────────────
+                MIFARE_WRITE => {
+                    if let Some((ref mut s, _)) = crypto {
+                        // ACK (chiffré) puis ignorer les 16 bytes data
+                        let ack = 0x0Au8 ^ s.keystream_byte();
+                        let _ = self.tg_set_data(&[ack]);
+                    }
+                }
+
+                // ── Déconnexion / commande inconnue ────────────────────────
+                _ => {
+                    crypto = None;
+                    // Tentative de ré-init cible pour le prochain passage
+                    if self.tg_init_as_target(&uid4, sak, atqa).is_err() {
+                        return EmulResult::Done;
+                    }
+                    status("Pret — attente lecteur");
+                }
+            }
+        }
+    }
+}
+
+/// Convertit un numéro de bloc en numéro de secteur selon le type de carte.
+fn block_to_sector(card_type: ClassicType, block: u8) -> u8 {
+    match card_type {
+        ClassicType::Classic4K if block >= 128 => 32 + (block - 128) / 16,
+        _ => block / 4,
+    }
+}
 
 /// Log un dump MIFARE Classic ligne par ligne.
 /// Logique de présentation, gardée côté firmware (la struct est dans core).
@@ -1155,10 +1312,22 @@ pub fn print_dump_log(dump: &MifareDump) {
                 "Bloc {:03}: {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X} \
                  {:02X}{:02X}{:02X}{:02X} {:02X}{:02X}{:02X}{:02X}",
                 block,
-                d[0], d[1], d[2], d[3],
-                d[4], d[5], d[6], d[7],
-                d[8], d[9], d[10], d[11],
-                d[12], d[13], d[14], d[15]
+                d[0],
+                d[1],
+                d[2],
+                d[3],
+                d[4],
+                d[5],
+                d[6],
+                d[7],
+                d[8],
+                d[9],
+                d[10],
+                d[11],
+                d[12],
+                d[13],
+                d[14],
+                d[15]
             );
         } else {
             log::info!("Bloc {:03}: -- non lisible --", block);

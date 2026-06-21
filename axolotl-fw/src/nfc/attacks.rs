@@ -60,11 +60,19 @@ pub fn keys_from_dump(dump: &MifareDump) -> Vec<SectorKey> {
         let blk = &dump.blocks[trailer];
         let key_a: [u8; 6] = blk[0..6].try_into().unwrap();
         if key_a != [0u8; 6] {
-            out.push(SectorKey { sector, key_ab: 0, key: key_a });
+            out.push(SectorKey {
+                sector,
+                key_ab: 0,
+                key: key_a,
+            });
         }
         let key_b: [u8; 6] = blk[10..16].try_into().unwrap();
         if key_b != [0u8; 6] && key_b != key_a {
-            out.push(SectorKey { sector, key_ab: 1, key: key_b });
+            out.push(SectorKey {
+                sector,
+                key_ab: 1,
+                key: key_b,
+            });
         }
     }
     out
@@ -83,13 +91,29 @@ pub fn dump_all_sectors<F: FnMut(u8, u8)>(
     log::info!("╔══════════════════════════════════════════╗");
     log::info!("║       MIFARE CLASSIC — DICT ATTACK       ║");
     log::info!("╠══════════════════════════════════════════╣");
-    log::info!("║ UID  : {:02X}:{:02X}:{:02X}:{:02X}                      ║",
-        uid.bytes[0], uid.bytes[1], uid.bytes[2], uid.bytes[3]);
-    log::info!("║ SAK  : 0x{:02X}  ATQA: {:02X}{:02X}                  ║",
-        uid.sak, uid.atqa[1], uid.atqa[0]);
-    log::info!("║ Type : {:?}   {} sec   {} blocs         ║",
-        card_type, total, card_type.block_count());
-    log::info!("║ Dico : {} cles                           ║", DEFAULT_KEYS.len());
+    log::info!(
+        "║ UID  : {:02X}:{:02X}:{:02X}:{:02X}                      ║",
+        uid.bytes[0],
+        uid.bytes[1],
+        uid.bytes[2],
+        uid.bytes[3]
+    );
+    log::info!(
+        "║ SAK  : 0x{:02X}  ATQA: {:02X}{:02X}                  ║",
+        uid.sak,
+        uid.atqa[1],
+        uid.atqa[0]
+    );
+    log::info!(
+        "║ Type : {:?}   {} sec   {} blocs         ║",
+        card_type,
+        total,
+        card_type.block_count()
+    );
+    log::info!(
+        "║ Dico : {} cles                           ║",
+        DEFAULT_KEYS.len()
+    );
     log::info!("╚══════════════════════════════════════════╝");
 
     let mut found_sectors = 0u8;
@@ -99,13 +123,17 @@ pub fn dump_all_sectors<F: FnMut(u8, u8)>(
         on_sector(sector, total);
         let trailer = card_type.sector_trailer(sector).unwrap();
 
-        log::info!("┌─ Secteur {:02}/{} ───────────────────────────", sector, total - 1);
+        log::info!(
+            "┌─ Secteur {:02}/{} ───────────────────────────",
+            sector,
+            total - 1
+        );
 
         match try_sector(pn532, &mut dump, sector, trailer, &uid4, &mut found_keys) {
-            Some(true) => { found_sectors += 1; }
-            Some(false) => {
-                log::warn!("└─ Secteur {:02}: ECHEC — aucune cle valide", sector);
+            Some(true) => {
+                found_sectors += 1;
             }
+            Some(false) => {}
             None => {
                 log::warn!("└─ Secteur {:02}: Carte absente — dump abandonne", sector);
                 break;
@@ -119,8 +147,16 @@ pub fn dump_all_sectors<F: FnMut(u8, u8)>(
     log::info!("╔══════════════════════════════════════════╗");
     log::info!("║              DUMP TERMINE                ║");
     log::info!("╠══════════════════════════════════════════╣");
-    log::info!("║ Secteurs lus : {:02}/{:02}                      ║", found_sectors, total);
-    log::info!("║ Blocs lus    : {:03}/{:03}                     ║", readable, total_blocks);
+    log::info!(
+        "║ Secteurs lus : {:02}/{:02}                      ║",
+        found_sectors,
+        total
+    );
+    log::info!(
+        "║ Blocs lus    : {:03}/{:03}                     ║",
+        readable,
+        total_blocks
+    );
     log::info!("╚══════════════════════════════════════════╝");
 
     (dump, found_keys)
@@ -136,54 +172,157 @@ fn try_sector(
     uid4: &[u8; 4],
     found_keys: &mut Vec<SectorKey>,
 ) -> Option<bool> {
+    // ── Phase 0 : réutilise les clés déjà trouvées (dédupliquées par valeur) ──
+    // Optimisation critique : si tous les secteurs partagent la même clé, le
+    // dict complet (238 essais × ~280 ms) n'est tenté qu'une seule fois au lieu
+    // de 16.  Réduit le temps de dump d'~2 min à ~10 s sur les badges monoclé.
+    {
+        let snapshot: Vec<SectorKey> = found_keys.to_vec();
+        let mut tried: Vec<([u8; 6], u8)> = Vec::new();
+        for sk in &snapshot {
+            let key_id = (sk.key, sk.key_ab);
+            if tried.contains(&key_id) {
+                continue;
+            }
+            tried.push(key_id);
+            let auth_cmd = if sk.key_ab == 0 {
+                MIFARE_AUTH_A
+            } else {
+                MIFARE_AUTH_B
+            };
+            if pn532.mifare_auth(trailer, auth_cmd, &sk.key, uid4).is_ok() {
+                log::info!(
+                    "│  [Key{} cache {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}] → OK ✓ (sec {:02})",
+                    if sk.key_ab == 0 { "A" } else { "B" },
+                    sk.key[0],
+                    sk.key[1],
+                    sk.key[2],
+                    sk.key[3],
+                    sk.key[4],
+                    sk.key[5],
+                    sk.sector
+                );
+                found_keys.push(SectorKey {
+                    sector,
+                    key_ab: sk.key_ab,
+                    key: sk.key,
+                });
+                read_sector_blocks(pn532, dump, sector);
+                log::info!(
+                    "└─ Secteur {:02}: OK ({} blocs)",
+                    sector,
+                    dump_sector_block_count(dump, sector)
+                );
+                return Some(true);
+            }
+            if !re_select_with_retry(pn532) {
+                log::warn!("│  Carte perdue (cache key)");
+                return None;
+            }
+        }
+    }
+
     let n = DEFAULT_KEYS.len();
 
-    // ── KeyA ──────────────────────────────────────────────────────────────
-    log::info!("│ [KeyA] bloc trailer={:03}", trailer);
+    // ── Phase 1 : KeyA — dict complet ─────────────────────────────────────
+    log::info!("│ [KeyA] dict {} cles (trailer={:03})", n, trailer);
     for (i, key) in DEFAULT_KEYS.iter().enumerate() {
         let ok = pn532.mifare_auth(trailer, MIFARE_AUTH_A, key, uid4).is_ok();
-        log::info!(
-            "│  A [{:02}/{}] {:02X}{:02X}{:02X}{:02X}{:02X}{:02X} → {}",
-            i + 1, n,
-            key[0], key[1], key[2], key[3], key[4], key[5],
-            if ok { "OK ✓" } else { "FAIL" }
-        );
         if ok {
-            log::info!("│  *** KeyA trouvee! Lecture du secteur {:02}... ***", sector);
-            found_keys.push(SectorKey { sector, key_ab: 0, key: *key });
+            log::info!(
+                "│  A [{:02}/{}] {:02X}{:02X}{:02X}{:02X}{:02X}{:02X} → OK ✓",
+                i + 1,
+                n,
+                key[0],
+                key[1],
+                key[2],
+                key[3],
+                key[4],
+                key[5]
+            );
+            found_keys.push(SectorKey {
+                sector,
+                key_ab: 0,
+                key: *key,
+            });
             read_sector_blocks(pn532, dump, sector);
-            log::info!("└─ Secteur {:02}: OK ({} blocs)", sector, dump_sector_block_count(dump, sector));
+            log::info!(
+                "└─ Secteur {:02}: OK ({} blocs)",
+                sector,
+                dump_sector_block_count(dump, sector)
+            );
             return Some(true);
         }
+        log::debug!(
+            "│  A [{:02}/{}] {:02X}{:02X}{:02X}{:02X}{:02X}{:02X} → FAIL",
+            i + 1,
+            n,
+            key[0],
+            key[1],
+            key[2],
+            key[3],
+            key[4],
+            key[5]
+        );
         if !re_select_with_retry(pn532) {
-            log::warn!("│  Carte perdue apres {} tentatives re_select", RE_SELECT_RETRIES);
+            log::warn!(
+                "│  Carte perdue apres {} tentatives re_select",
+                RE_SELECT_RETRIES
+            );
             return None;
         }
     }
 
-    // ── KeyB ──────────────────────────────────────────────────────────────
-    log::info!("│ [KeyB] bloc trailer={:03}", trailer);
+    // ── Phase 2 : KeyB — dict complet ─────────────────────────────────────
+    log::info!("│ [KeyB] dict {} cles (trailer={:03})", n, trailer);
     for (i, key) in DEFAULT_KEYS.iter().enumerate() {
         let ok = pn532.mifare_auth(trailer, MIFARE_AUTH_B, key, uid4).is_ok();
-        log::info!(
-            "│  B [{:02}/{}] {:02X}{:02X}{:02X}{:02X}{:02X}{:02X} → {}",
-            i + 1, n,
-            key[0], key[1], key[2], key[3], key[4], key[5],
-            if ok { "OK ✓" } else { "FAIL" }
-        );
         if ok {
-            log::info!("│  *** KeyB trouvee! Lecture du secteur {:02}... ***", sector);
-            found_keys.push(SectorKey { sector, key_ab: 1, key: *key });
+            log::info!(
+                "│  B [{:02}/{}] {:02X}{:02X}{:02X}{:02X}{:02X}{:02X} → OK ✓",
+                i + 1,
+                n,
+                key[0],
+                key[1],
+                key[2],
+                key[3],
+                key[4],
+                key[5]
+            );
+            found_keys.push(SectorKey {
+                sector,
+                key_ab: 1,
+                key: *key,
+            });
             read_sector_blocks(pn532, dump, sector);
-            log::info!("└─ Secteur {:02}: OK ({} blocs)", sector, dump_sector_block_count(dump, sector));
+            log::info!(
+                "└─ Secteur {:02}: OK ({} blocs)",
+                sector,
+                dump_sector_block_count(dump, sector)
+            );
             return Some(true);
         }
+        log::debug!(
+            "│  B [{:02}/{}] {:02X}{:02X}{:02X}{:02X}{:02X}{:02X} → FAIL",
+            i + 1,
+            n,
+            key[0],
+            key[1],
+            key[2],
+            key[3],
+            key[4],
+            key[5]
+        );
         if !re_select_with_retry(pn532) {
-            log::warn!("│  Carte perdue apres {} tentatives re_select", RE_SELECT_RETRIES);
+            log::warn!(
+                "│  Carte perdue apres {} tentatives re_select",
+                RE_SELECT_RETRIES
+            );
             return None;
         }
     }
 
+    log::warn!("└─ Secteur {:02}: ECHEC — aucune cle valide", sector);
     Some(false)
 }
 
@@ -194,7 +333,10 @@ fn re_select_with_retry(pn532: &mut Pn532) -> bool {
         }
         log::debug!("re_select {}/{} echouee", attempt + 1, RE_SELECT_RETRIES);
     }
-    log::warn!("re_select: carte hors champ apres {} essais", RE_SELECT_RETRIES);
+    log::warn!(
+        "re_select: carte hors champ apres {} essais",
+        RE_SELECT_RETRIES
+    );
     false
 }
 
@@ -232,7 +374,10 @@ fn dump_sector_block_count(dump: &MifareDump, sector: u8) -> u8 {
     let card_type = dump.card_type;
     let first = card_type.sector_first_block(sector).unwrap_or(0) as usize;
     let count = card_type.sector_block_count(sector) as usize;
-    dump.readable[first..first + count].iter().filter(|&&r| r).count() as u8
+    dump.readable[first..first + count]
+        .iter()
+        .filter(|&&r| r)
+        .count() as u8
 }
 
 fn uid_to_4bytes(uid: &NfcUid) -> [u8; 4] {

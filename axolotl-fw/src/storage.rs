@@ -16,12 +16,12 @@ use esp_idf_svc::fs::fatfs::Fatfs;
 const MOUNT_POINT: &str = "/sdcard";
 const FLASH_MOUNT: &str = "/spiflash";
 
-/// Trait minimal utilisé par les fonctions UI pour écrire / lister.
-/// Permet de passer `&dyn SdWrite` sans exposer le type générique complet.
+/// Trait minimal utilisé par les fonctions UI pour écrire un fichier sur le
+/// stockage actif (SD ou flash interne) sans exposer le type générique complet.
+/// Les lectures et listings passent directement par `std::fs` (cf. `main.rs`)
+/// car ils doivent scanner les DEUX racines `/sdcard` + `/spiflash`.
 pub trait SdWrite {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()>;
-    fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>>;
-    fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>>;
 }
 
 pub struct SdStorage<'d, T = SpiDriver<'d>>
@@ -68,38 +68,18 @@ where
     /// Écrit `data` dans `/sdcard{path}` (crée ou écrase).
     pub fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         let full = format!("{}{}", MOUNT_POINT, path);
-        let mut f = fs::File::create(&full)
-            .map_err(|e| anyhow::anyhow!("SD create {}: {}", full, e))?;
+        // Garantit l'arborescence (ex: /sdcard/NFC/dumps) avant l'écriture :
+        // le create_dir_all du `new()` peut échouer silencieusement si la SD a
+        // hoqueté au montage → sinon File::create renvoie ENOENT.
+        if let Some(parent) = std::path::Path::new(&full).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut f =
+            fs::File::create(&full).map_err(|e| anyhow::anyhow!("SD create {}: {}", full, e))?;
         f.write_all(data)
             .map_err(|e| anyhow::anyhow!("SD write {}: {}", full, e))?;
         log::info!("SD: {} ({} bytes)", full, data.len());
         Ok(())
-    }
-
-    /// Lit un fichier complet.
-    pub fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        let full = format!("{}{}", MOUNT_POINT, path);
-        fs::read(&full).map_err(|e| anyhow::anyhow!("SD read {}: {}", full, e))
-    }
-
-    /// Liste les noms de fichiers d'un dossier.
-    pub fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
-        let full = format!("{}{}", MOUNT_POINT, path);
-        let entries = fs::read_dir(&full)
-            .map_err(|e| anyhow::anyhow!("SD list {}: {}", full, e))?;
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-
-    /// Vérifie si un fichier existe.
-    #[allow(dead_code)]
-    pub fn exists(&self, path: &str) -> bool {
-        fs::metadata(format!("{}{}", MOUNT_POINT, path)).is_ok()
     }
 }
 
@@ -109,14 +89,6 @@ where
 {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         SdStorage::write_file(self, path, data)
-    }
-
-    fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        SdStorage::read_file(self, path)
-    }
-
-    fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
-        SdStorage::list_dir(self, path)
     }
 }
 
@@ -142,8 +114,7 @@ impl InternalFs {
             .map_err(|e| anyhow::anyhow!("Partition lookup: {e:?}"))?
             .ok_or_else(|| anyhow::anyhow!("Partition 'storage' introuvable"))?;
 
-        let wl = EspWlPartition::new(partition)
-            .map_err(|e| anyhow::anyhow!("WL mount: {e:?}"))?;
+        let wl = EspWlPartition::new(partition).map_err(|e| anyhow::anyhow!("WL mount: {e:?}"))?;
 
         let wl_handle = wl.handle();
         let fatfs = unsafe { Fatfs::new_wl_part(0, wl_handle) }
@@ -155,53 +126,28 @@ impl InternalFs {
         log::info!("InternalFs: FAT monte sur {}", FLASH_MOUNT);
         let _ = fs::create_dir_all(format!("{}/NFC/dumps", FLASH_MOUNT));
 
-        Ok(Self { _mounted: mounted, _wl: wl })
+        Ok(Self {
+            _mounted: mounted,
+            _wl: wl,
+        })
     }
 
     pub fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         let full = format!("{}{}", FLASH_MOUNT, path);
-        let mut f = fs::File::create(&full)
-            .map_err(|e| anyhow::anyhow!("Flash create {}: {}", full, e))?;
+        if let Some(parent) = std::path::Path::new(&full).parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut f =
+            fs::File::create(&full).map_err(|e| anyhow::anyhow!("Flash create {}: {}", full, e))?;
         f.write_all(data)
             .map_err(|e| anyhow::anyhow!("Flash write {}: {}", full, e))?;
         log::info!("Flash: {} ({} bytes)", full, data.len());
         Ok(())
-    }
-
-    pub fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        let full = format!("{}{}", FLASH_MOUNT, path);
-        fs::read(&full).map_err(|e| anyhow::anyhow!("Flash read {}: {}", full, e))
-    }
-
-    pub fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
-        let full = format!("{}{}", FLASH_MOUNT, path);
-        let entries = fs::read_dir(&full)
-            .map_err(|e| anyhow::anyhow!("Flash list {}: {}", full, e))?;
-        let mut names = Vec::new();
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_string());
-            }
-        }
-        Ok(names)
-    }
-
-    #[allow(dead_code)]
-    pub fn exists(&self, path: &str) -> bool {
-        fs::metadata(format!("{}{}", FLASH_MOUNT, path)).is_ok()
     }
 }
 
 impl SdWrite for InternalFs {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         InternalFs::write_file(self, path, data)
-    }
-
-    fn read_file(&self, path: &str) -> anyhow::Result<Vec<u8>> {
-        InternalFs::read_file(self, path)
-    }
-
-    fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
-        InternalFs::list_dir(self, path)
     }
 }
