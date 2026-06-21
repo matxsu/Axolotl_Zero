@@ -172,10 +172,10 @@ Au démarrage, le device affiche un splash avec le logo Axolotl, puis le menu pr
 - [x] Driver PN532 (I²C) — lecture UID
 
 ### 🚧 Phase 2 — Modules offensifs *(M3 → M7)*
-- [ ] **NFC** : auth MIFARE, dump dictionnaire, clonage magic card
-- [ ] **Wi-Fi** : scan, deauth, evil twin
-- [ ] **BadUSB** : HID clavier + parser DuckyScript
-- [ ] **Sub-GHz** : driver CC1101, capture/replay 433 MHz
+- [x] **NFC** : auth MIFARE, dump par dictionnaire (cache clés), clonage magic gen2/gen1a, wipe — émulation Crypto1 écrite mais **non vérifiée sur lecteur réel**
+- [~] **Wi-Fi** : AP SoftAP + file browser web ✅ — scan / deauth / evil twin à faire
+- [ ] **BadUSB** : HID clavier + parser DuckyScript *(pas commencé)*
+- [~] **Sub-GHz** : driver CC1101 écrit (`subghz.rs`) mais **pas câblé** au menu ; capture/replay à finir (GDO0 non connecté)
 
 ### 🎯 Phase 3 — Finition *(M7 → M10)*
 - [ ] Intégration boîtier final
