@@ -11,6 +11,10 @@ use super::Pn532;
 
 const RE_SELECT_RETRIES: u8 = 5;
 
+/// Cadence du log de progression pendant le brute-force d'un secteur (1 ligne
+/// INFO toutes les N clés essayées). Évite les longs silences trompeurs.
+const PROGRESS_EVERY: usize = 32;
+
 /// Clé trouvée pour un secteur pendant le dict attack.
 #[derive(Clone, Copy)]
 pub struct SectorKey {
@@ -264,6 +268,12 @@ fn try_sector(
             key[4],
             key[5]
         );
+        // Battement de progression visible en INFO : sans ça, le dict complet
+        // d'un secteur protégé reste ~100 s sans aucun log → on ne sait pas si
+        // le device bosse ou s'il a planté.
+        if (i + 1) % PROGRESS_EVERY == 0 {
+            log::info!("│  KeyA … {}/{} cles testees (en cours)", i + 1, n);
+        }
         if !re_select_with_retry(pn532) {
             log::warn!(
                 "│  Carte perdue apres {} tentatives re_select",
@@ -313,6 +323,9 @@ fn try_sector(
             key[4],
             key[5]
         );
+        if (i + 1) % PROGRESS_EVERY == 0 {
+            log::info!("│  KeyB … {}/{} cles testees (en cours)", i + 1, n);
+        }
         if !re_select_with_retry(pn532) {
             log::warn!(
                 "│  Carte perdue apres {} tentatives re_select",
