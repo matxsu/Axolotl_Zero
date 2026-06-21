@@ -369,66 +369,53 @@ L'ESP32-S3 supporte nativement USB OTG. L'énumération se fait au moment où le
 
 ### Arborescence du firmware
 
+> ⚠️ Arborescence RÉELLE (21 juin 2026). L'éclatement `ui/`/`drivers/`/`screens/`
+> décrit dans les versions précédentes de ce document n'a **jamais été
+> implémenté** : le firmware est monolithique (`main.rs` contient init + menu +
+> tous les écrans), et toute la logique pure et testable vit dans le crate
+> séparé **`axolotl-core`**. Les stubs/duplicats ont été supprimés.
+
 ```
-axolotl-fw/src/
-├── main.rs              Boot + boucle événementielle (< 150 lignes visé)
-├── logo.rs              Bitmap 120×60 du splash (généré)
-├── ui/
-│   ├── mod.rs
-│   ├── menu.rs          Menu principal (MenuItem, render)
-│   ├── theme.rs         Couleurs, polices, tailles
-│   └── screens/
-│       ├── mod.rs
-│       ├── nfc.rs       Écran NFC : scan, dump, résultats
-│       ├── wifi.rs      Écran Wi-Fi : scan, deauth, AP
-│       ├── bad_usb.rs   Écran BadUSB : liste payloads, exec
-│       ├── sub_ghz.rs   Écran Sub-GHz : capture, replay
-│       └── storage.rs   Écran stockage : liste fichiers, stats
-├── drivers/
-│   ├── mod.rs
-│   ├── buttons.rs       Struct Buttons {up, down, left, right, center}
-│   ├── display.rs       Wrapper ST7789, helpers draw
-│   ├── pn532.rs         Driver I²C PN532 (from scratch)
-│   ├── cc1101.rs        Driver SPI CC1101 (from scratch)
-│   └── sdcard.rs        Wrapper FAT32
-├── nfc/
-│   ├── mod.rs           NfcTarget, high-level API
-│   ├── mifare.rs        Authenticate, read_block, write_block
-│   ├── attacks.rs       Dictionary attack, nested (stretch)
-│   ├── keys.rs          Default key dictionary
-│   └── dump.rs          Format .mfd compatible Flipper/Proxmark
-├── wifi/
-│   ├── mod.rs
-│   ├── scan.rs          Liste réseaux + métadonnées
-│   ├── deauth.rs        Injection de trames 802.11
-│   └── evil_twin.rs     AP + portail captif
-├── bad_usb/
-│   ├── mod.rs
-│   ├── hid.rs           Driver HID keyboard
-│   ├── ducky.rs         Parser DuckyScript
-│   └── runner.rs        Exécution de payload
-└── sub_ghz/
-    ├── mod.rs
-    ├── config.rs        Registres CC1101 pour différents protocoles
-    ├── capture.rs       RX + décodage ASK/OOK
-    └── replay.rs        TX d'une trame capturée
+axolotl-zero/                    Workspace Cargo
+├── axolotl-core/                Lib portable (testable sur PC, #[test])
+│   └── src/
+│       ├── lib.rs               Re-exports
+│       ├── card.rs              NfcUid : type carte d'après SAK
+│       ├── layout.rs            ClassicType : géométrie 1K/4K/Mini
+│       ├── dump.rs              MifareDump : (dé)sérialisation .mfd
+│       ├── acl.rs               AccessConditions : parse access bits
+│       ├── keys.rs              Dictionnaire clés MIFARE par défaut
+│       ├── protocol.rs          Constantes commandes MIFARE
+│       ├── crypto1.rs           LFSR Crypto1 (auth, keystream) — pour l'émulation
+│       ├── mfd.rs               Helpers format .mfd
+│       └── diff.rs              Comparaison de dumps
+└── axolotl-fw/src/              Firmware ESP32-S3
+    ├── main.rs                  Boot + menu + TOUS les écrans (monolithique)
+    ├── logo.rs                  Bitmap splash (généré)
+    ├── nfc/
+    │   ├── mod.rs               Driver PN532 (I²C, from scratch) + MIFARE
+    │   │                        auth/read/write + clone magic + wipe + émulation
+    │   └── attacks.rs           Dump par dictionnaire (cache clés Phase 0)
+    ├── storage.rs               SD card FAT + flash interne (fallback)
+    ├── wifi/
+    │   ├── mod.rs               AP SoftAP + serveur HTTP (file browser)
+    │   └── index.html           Interface web embarquée (include_bytes!)
+    └── subghz.rs                Driver CC1101 (OOK/Princeton/RSSI) — ÉCRIT mais
+                                 PAS câblé dans main.rs (menu Sub-GHz = placeholder)
 ```
 
 ### Couches logicielles
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                 APPLICATION                     │
-│  (nfc::attacks, wifi::deauth, bad_usb::runner)  │
-│            Business logic, attaques             │
+│              APPLICATION + UI                   │
+│   main.rs : menu, écrans, navigation, rendu     │
+│         (monolithique, mono-tâche)              │
 ├─────────────────────────────────────────────────┤
-│                      UI                         │
-│        (ui::menu, ui::screens::*)               │
-│   Rendu, gestion boutons, navigation écrans     │
-├─────────────────────────────────────────────────┤
-│                   DRIVERS                       │
-│  (drivers::pn532, drivers::cc1101, buttons...)  │
-│       Abstraction matérielle custom             │
+│          LOGIQUE MÉTIER / DRIVERS               │
+│   nfc::Pn532 (driver+MIFARE+émul), nfc::attacks │
+│   storage, wifi::WebServer, subghz::Cc1101      │
+│   axolotl-core : dump, crypto1, keys, layout…   │
 ├─────────────────────────────────────────────────┤
 │         esp-idf-svc  /  esp-idf-hal             │
 │       Bindings Rust vers ESP-IDF                │
@@ -630,7 +617,7 @@ Même puce que le Flipper Zero. Choix motivé par :
 ### 8.5 Bus SPI unique
 
 Alternative évaluée : un SPI par périphérique (SPI2 pour LCD, SPI3 pour SD+CC1101). **Rejeté** car :
-- L'ESP32-S3 n'a que 2 SPI "généraux" (SPI2/SPI3), donc pas de marge
+- L'ESP32-S3 n'a que 2 SPI "agénéraux" (SPI2/SPI3), donc pas de marge
 - Le partage via `SpiDeviceDriver` est le pattern officiel recommandé par Espressif
 - Les périphériques ont des fréquences compatibles (40/20/5 MHz)
 - Le HAL gère le multiplexage temporel correctement

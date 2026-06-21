@@ -37,33 +37,41 @@ laboratoire ESGI sur du matériel appartenant à l'équipe.
 
 ## Arborescence
 
+> ⚠️ Structure RÉELLE (juin 2026). L'ancienne arborescence `ui/ drivers/ bad_usb/
+> sub_ghz/` n'a jamais été adoptée : l'implémentation est partie monolithique
+> dans `main.rs` + modules par feature. Ces stubs/duplicats ont été supprimés.
+
 ```
-axolotl-zero/
+axolotl-zero/                    Workspace Cargo (2 crates)
 ├── README.md                    Vitrine publique
-├── CLAUDE.md                    Ce fichier
-├── LICENSE                      MIT
-├── docs/
-│   ├── cahier-des-charges.md   CDC v1.1 (markdown)
-│   ├── architecture.md          Architecture technique
-│   ├── hardware/                Schémas, pinout, BOM
-│   └── features/                Spec détaillée par module
-├── axolotl-fw/                  Firmware Rust
-│   ├── Cargo.toml
-│   ├── src/
-│   │   ├── main.rs              Init hardware + boucle menu (SLIM)
-│   │   ├── logo.rs              Bitmap splash
-│   │   ├── ui/                  Screens, menu, theme
-│   │   ├── drivers/             Buttons, display, PN532, CC1101, SD
-│   │   ├── nfc/                 MIFARE auth/read/write, attacks, keys
-│   │   ├── wifi/                Scan, deauth, evil twin
-│   │   ├── bad_usb/             HID, DuckyScript parser
-│   │   └── sub_ghz/             CC1101 config, capture, replay
-│   ├── .cargo/config.toml       Target Xtensa
-│   ├── rust-toolchain.toml      Channel esp
-│   └── sdkconfig.defaults       Stack sizes + FATFS
-└── .github/workflows/
-    └── rust_ci.yml              Build + clippy + fmt
+├── CLAUDE.md                    Ce fichier (lu auto à chaque session)
+├── ARCHITECTURE.md              Architecture technique (HW + SW)
+├── Cargo.toml                   Manifeste workspace
+├── dictionaries/mfc_keys.dic    Dico clés MIFARE complet (référence)
+├── docs/features/               Spec par module (nfc-rfid, wifi, sub-ghz, bad-usb)
+├── axolotl-core/                Lib portable, testable sur PC (logique pure)
+│   └── src/                     card, dump, layout, keys, protocol, acl, crypto1, diff, mfd
+└── axolotl-fw/                  Firmware Rust (ESP32-S3)
+    ├── Cargo.toml
+    ├── partitions.csv           Table partitions (flash 16 MB)
+    ├── .cargo/config.toml       Target Xtensa
+    ├── rust-toolchain.toml      Channel esp
+    ├── sdkconfig.defaults       Stack sizes + FATFS
+    └── src/
+        ├── main.rs              Init HW + menu + TOUS les écrans (monolithique)
+        ├── logo.rs              Bitmap splash
+        ├── nfc/
+        │   ├── mod.rs           Driver PN532 (I²C) + MIFARE + émulation Crypto1
+        │   └── attacks.rs       Dump par dictionnaire (cache clés Phase 0)
+        ├── storage.rs           SD card + flash interne (FAT, fallback)
+        ├── wifi/
+        │   ├── mod.rs           AP + serveur HTTP (file browser)
+        │   └── index.html       Interface web embarquée
+        └── subghz.rs            Driver CC1101 — ÉCRIT mais PAS câblé dans main.rs
 ```
+
+> 💡 Refactor possible (non fait) : éclater `main.rs` en `ui/`/`screens/`. À ne
+> tenter que volontairement — pas re-créer de stubs vides.
 
 ---
 
@@ -246,25 +254,26 @@ main                          stable, démontrable, tags de release
 
 ## Features implémentées / à faire
 
+> État réel au 21 juin 2026. Ne PAS sur-vendre : « émulation » et « Sub-GHz »
+> sont écrits mais non validés sur matériel — voir les notes.
+
 | Module | État | Détails |
 |---|---|---|
-| **UI menu** | ✅ Partiel | Menu 5-way OK, refactor en sous-modules à faire |
+| **UI menu** | ✅ OK | Menu 5-way, tous les écrans (monolithique dans `main.rs`) |
 | **Display ST7789** | ✅ OK | 240x240, splash logo |
-| **SD card FAT** | ✅ OK | Mount + read/write/list |
-| **NFC — UID scan** | ✅ OK | `Pn532::read_uid` |
-| **NFC — ATQA/SAK** | ⚠️ À ajouter | Données présentes mais pas remontées |
-| **NFC — MIFARE auth** | ❌ À faire | `InDataExchange` + `MFAuthent` |
-| **NFC — MIFARE read** | ❌ À faire | `MFRead` |
-| **NFC — Dump complet** | ❌ À faire | Attaque par dictionnaire |
-| **NFC — Magic card write** | ❌ Stretch | Écriture bloc 0 |
-| **Wi-Fi — Scan** | ❌ À faire | `esp_wifi_scan_*` |
-| **Wi-Fi — Deauth** | ❌ À faire | Mode promiscuous + inject |
-| **Wi-Fi — Evil twin** | ❌ Stretch | AP + portail captif |
-| **BadUSB — HID** | ❌ À faire | TinyUSB HID keyboard |
-| **BadUSB — DuckyScript** | ❌ À faire | Parser + exécuteur |
-| **Sub-GHz — Driver CC1101** | ❌ À faire | SPI config + registres |
-| **Sub-GHz — Capture** | ❌ À faire | ASK/OOK decode |
-| **Sub-GHz — Replay** | ❌ À faire | Re-émission trame |
+| **Storage FAT** | ✅ OK | SD card + fallback flash interne `/spiflash`, scan des 2 racines |
+| **NFC — UID scan + ATQA/SAK** | ✅ OK | `read_uid`, type carte remonté |
+| **NFC — MIFARE auth/read** | ✅ OK | `InDataExchange` (KeyA/KeyB) |
+| **NFC — Dump dict complet** | ✅ OK | 238 clés, cache clés Phase 0 (badge monoclé ~12 s) |
+| **NFC — Clone magic** | ✅ OK | gen2/CUID (write bloc 0) + fallback gen1a (backdoor 0x40) ; garde-fou non-magic anti-brick |
+| **NFC — Wipe gen1a** | ✅ OK | Efface une carte magic via backdoor |
+| **NFC — Émulation Crypto1** | ⚠️ Implémentée, NON vérifiée | Crypto1 logiciel côté ESP32 ; échoue souvent sur lecteur réel (timing PN532) |
+| **NFC — Darkside / Nested / PRNG** | ❌ Retirées | Le PN532 (I²C) ne permet pas le bit-timing → Proxmark3 requis |
+| **Wi-Fi — AP + file browser web** | ✅ OK | SoftAP `AxolotlZero`, serveur HTTP, IP `192.168.71.1` |
+| **Wi-Fi — Scan / Deauth / Evil twin** | ❌ À faire | — |
+| **BadUSB (HID + DuckyScript)** | ❌ À faire | Pas commencé |
+| **Sub-GHz — Driver CC1101** | ⚠️ Écrit, NON câblé | `subghz.rs` complet (OOK/Princeton/RSSI) mais aucun `mod subghz` dans `main.rs` → menu = placeholder |
+| **Sub-GHz — Capture / Replay** | ❌ À faire | Driver non câblé ; GDO0=NC limite la capture (polling RSSI) |
 
 ---
 
