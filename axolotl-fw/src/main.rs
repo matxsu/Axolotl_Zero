@@ -1235,7 +1235,9 @@ where
     .draw(display)
     .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    let mut status_line = String::from("init...");
+    // L'émulation bloque sur TgInitAsTarget tant qu'aucun lecteur n'active la
+    // cible : l'écran affiche la consigne pendant toute la fenêtre d'attente.
+    let mut status_line = String::from("Approche lecteur...");
     let draw_status = |display: &mut D, line: &str| -> anyhow::Result<()> {
         // Efface la zone de status (y=90..115) et réaffiche
         Rectangle::new(Point::new(0, 85), Size::new(240, 30))
