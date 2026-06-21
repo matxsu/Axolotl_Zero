@@ -567,7 +567,13 @@ where
                         FreeRtos::delay_ms(10);
                     }
                     run_nfc_attacks(
-                        display, pn532, &found_keys, btn_up, btn_dwn, btn_mid, btn_lft,
+                        display,
+                        pn532,
+                        &found_keys,
+                        btn_up,
+                        btn_dwn,
+                        btn_mid,
+                        btn_lft,
                     )?;
                     draw_post_dump_with_attack(display, readable_count, total, &acl, !can_clone)?;
                 }
