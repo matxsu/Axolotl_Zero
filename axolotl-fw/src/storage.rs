@@ -72,7 +72,12 @@ where
         // le create_dir_all du `new()` peut échouer silencieusement si la SD a
         // hoqueté au montage → sinon File::create renvoie ENOENT.
         if let Some(parent) = std::path::Path::new(&full).parent() {
-            let _ = fs::create_dir_all(parent);
+            // On NE swallow PLUS l'erreur : si la création échoue (carte en
+            // lecture seule, FAT corrompue, mount-root…), File::create plante
+            // ensuite avec un ENOENT trompeur. Ce warn donne la vraie cause.
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::warn!("SD create_dir_all {}: {}", parent.display(), e);
+            }
         }
         let mut f =
             fs::File::create(&full).map_err(|e| anyhow::anyhow!("SD create {}: {}", full, e))?;
@@ -135,7 +140,9 @@ impl InternalFs {
     pub fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         let full = format!("{}{}", FLASH_MOUNT, path);
         if let Some(parent) = std::path::Path::new(&full).parent() {
-            let _ = fs::create_dir_all(parent);
+            if let Err(e) = fs::create_dir_all(parent) {
+                log::warn!("Flash create_dir_all {}: {}", parent.display(), e);
+            }
         }
         let mut f =
             fs::File::create(&full).map_err(|e| anyhow::anyhow!("Flash create {}: {}", full, e))?;

@@ -849,7 +849,8 @@ impl<'d> Pn532<'d> {
                     continue; // bloc 0 (UID) conservé — anti-brick
                 }
                 total += 1;
-                if self.wipe_block_any_key(blk, &ZERO_BLOCK, &uid4, sector, last_keys, &mut working) {
+                if self.wipe_block_any_key(blk, &ZERO_BLOCK, &uid4, sector, last_keys, &mut working)
+                {
                     written += 1;
                     on_block(blk, 0x00);
                 } else {
@@ -1486,6 +1487,10 @@ pub fn print_dump_log(dump: &MifareDump) {
         dump.readable_count(),
         total
     );
+    // On ne logue QUE les blocs lisibles : sur une carte protégée, lister 64
+    // lignes « non lisible » noyait l'info utile. Les numéros illisibles sont
+    // résumés en une seule ligne ; le dump complet reste écrit dans le .txt.
+    let mut unreadable = String::new();
     for block in 0..total {
         if dump.readable[block] {
             let d = &dump.blocks[block];
@@ -1511,7 +1516,17 @@ pub fn print_dump_log(dump: &MifareDump) {
                 d[15]
             );
         } else {
-            log::info!("Bloc {:03}: -- non lisible --", block);
+            if !unreadable.is_empty() {
+                unreadable.push(' ');
+            }
+            unreadable.push_str(&format!("{:03}", block));
         }
+    }
+    if !unreadable.is_empty() {
+        log::info!(
+            "Blocs non lisibles ({}) : {}",
+            total - dump.readable_count(),
+            unreadable
+        );
     }
 }
