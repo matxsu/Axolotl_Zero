@@ -1,0 +1,17 @@
+# Cargo build artifacts (workspace root + per-crate)
+/target/
+/Cargo.lock
+/axolotl-fw/target/
+/axolotl-fw/Cargo.lock
+/axolotl-core/target/
+
+# ESP-IDF embuild cache (downloaded toolchain + patched ESP-IDF sources)
+/.embuild/
+/axolotl-fw/.embuild/
+
+# IDE
+/.vscode/
+/.idea/
+
+# SD card test storage
+/Storage/

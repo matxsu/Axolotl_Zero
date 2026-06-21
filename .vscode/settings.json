@@ -1,0 +1,27 @@
+﻿{
+    "editor.formatOnSave": true,
+    "editor.rulers": [100],
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "rust-analyzer.cargo.target": "xtensa-esp32s3-espidf",
+    "rust-analyzer.check.command": "check",
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "rust-analyzer.procMacro.enable": true,
+    "rust-analyzer.linkedProjects": [
+        "axolotl-fw/Cargo.toml"
+    ],
+    "files.watcherExclude": {
+        "**/target/**": true,
+        "**/.embuild/**": true
+    },
+    "files.exclude": {
+        "**/target": true,
+        "**/.embuild": true
+    },
+    "todo-tree.general.tags": ["TODO", "FIXME", "HACK", "XXX"],
+    "files.associations": {
+        "*.toml": "toml",
+        "sdkconfig.defaults": "properties"
+    }
+}
