@@ -10,6 +10,7 @@
 //! Un signal OOK est une suite de durées en µs, convention Flipper RAW :
 //!   - valeur **positive** = porteuse active (tone),
 //!   - valeur **négative** = silence.
+//!
 //! Exactement le format `RAW_Data:` des fichiers `.sub`, ce qui rend le RAW
 //! triviale à rejouer et l'encodage de protocole comparable au RAW capturé.
 
@@ -169,6 +170,7 @@ impl SubFile {
 ///   - bit `1` : tone long (3·te) puis silence court (te),
 ///   - bit `0` : tone court (te) puis silence long (3·te),
 ///   - stop : tone court (te) puis long silence de garde (≈ 30·te).
+///
 /// Les bits sont émis du MSB au LSB sur `bits` bits.
 pub fn encode_princeton(key: u64, bits: u8, te_us: u32, repeat: u8) -> Vec<i32> {
     let te = te_us as i32;

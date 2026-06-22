@@ -300,6 +300,20 @@ impl<'d> Cc1101<'d> {
         self.configure_ook(band)
     }
 
+    /// Règle la fréquence porteuse exacte en Hz, sans toucher au reste de la
+    /// config OOK. Utilisé pour rejouer un `.sub` sur sa fréquence d'origine
+    /// (la DB contient des fréquences arbitraires, pas seulement les bandes ISM
+    /// rondes) : un écart de quelques kHz suffit à faire échouer un récepteur.
+    pub fn set_frequency_hz(&mut self, hz: u32) -> anyhow::Result<()> {
+        // FREQ = f_carrier × 2^16 / f_xosc (Xosc = 26 MHz). Cf. CC1101 §21.
+        let freq_val = (hz as u64 * 65_536 / 26_000_000) as u32;
+        self.strobe(SIDLE)?;
+        self.write_reg(FREQ2, (freq_val >> 16) as u8)?;
+        self.write_reg(FREQ1, (freq_val >> 8) as u8)?;
+        self.write_reg(FREQ0, freq_val as u8)?;
+        Ok(())
+    }
+
     // ── RSSI ──────────────────────────────────────────────────────────────
 
     /// RSSI instantané en dBm (CC1101: raw/2 - 74).
@@ -543,6 +557,81 @@ impl<'d> Cc1101<'d> {
         }
         self.strobe(SIDLE)?;
         self.strobe(SFTX)?;
+        Ok(())
+    }
+
+    /// Émet une liste de timings canonique (convention Flipper RAW : valeur
+    /// positive = porteuse active, négative = silence ; magnitude en µs) via le
+    /// FIFO OOK. C'est le point d'entrée du replay de `.sub` (le core convertit
+    /// RAW **et** protocoles décodés vers ce format commun).
+    ///
+    /// Approximatif : chaque durée est quantifiée en multiples de `chip_us`
+    /// (1 octet FIFO ≈ `chip_us` µs). Fidèle pour les protocoles décodés dont
+    /// les durées sont des multiples de TE (Princeton…), plus grossier sur du
+    /// RAW arbitraire. Le replay RAW à résolution ~µs viendra avec la couche RMT
+    /// (GDO0=GPIO38).
+    pub fn transmit_timings(
+        &mut self,
+        timings: &[i32],
+        chip_us: u32,
+        repeat: u8,
+    ) -> anyhow::Result<()> {
+        if timings.is_empty() {
+            return Ok(());
+        }
+        let chip = chip_us.max(50);
+        let dr_bps = 1_000_000u32.saturating_div(chip);
+        let (m4, m3) = bps_to_mdmcfg(dr_bps);
+
+        self.strobe(SIDLE)?;
+        self.write_reg(MDMCFG4, m4)?;
+        self.write_reg(MDMCFG3, m3)?;
+
+        // Encode les timings en octets OOK (1 octet ≈ chip µs). Garde RF off
+        // initiale pour stabiliser le PA avant le 1er front.
+        let mut payload: Vec<u8> = Vec::with_capacity(timings.len() * 2 + 2);
+        payload.extend_from_slice(&[0x00; 2]);
+        for &t in timings {
+            let fill = if t >= 0 { 0xFFu8 } else { 0x00u8 };
+            let n = (t.unsigned_abs() / chip).clamp(1, 255) as usize;
+            payload.resize(payload.len() + n, fill);
+        }
+
+        for _ in 0..repeat.max(1) {
+            self.strobe(SFTX)?;
+            let mut pos = 0usize;
+            let mut tx_started = false;
+            while pos < payload.len() {
+                let end = (pos + 60).min(payload.len());
+                self.burst_write(TXFIFO_BURST, &payload[pos..end])?;
+                if !tx_started {
+                    self.strobe(STX)?;
+                    tx_started = true;
+                }
+                pos = end;
+                for _ in 0..200u32 {
+                    if self.read_status_reg(TXBYTES)? & 0x7F < 32 {
+                        break;
+                    }
+                    FreeRtos::delay_ms(1);
+                }
+            }
+            for _ in 0..500u32 {
+                let s = self.read_status_reg(MARCSTATE)? & 0x1F;
+                if s == 0x01 || s == 0x16 {
+                    break;
+                }
+                FreeRtos::delay_ms(2);
+            }
+        }
+        self.strobe(SIDLE)?;
+        self.strobe(SFTX)?;
+        log::info!(
+            "CC1101 TX timings: {} fronts × {} @ chip {}µs",
+            timings.len(),
+            repeat.max(1),
+            chip
+        );
         Ok(())
     }
 }

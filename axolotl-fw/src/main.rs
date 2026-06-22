@@ -759,7 +759,16 @@ where
 
 // ── Sub-GHz (CC1101) ────────────────────────────────────────────────────────
 
-const SUBGHZ_ITEMS: &[&str] = &["Scan RSSI", "TX Princeton test", "Changer bande", "Retour"];
+const SUBGHZ_ITEMS: &[&str] = &[
+    "Scan RSSI",
+    "TX Princeton test",
+    "Charger .sub (SD)",
+    "Changer bande",
+    "Retour",
+];
+
+/// Index de l'item "Changer bande" dans `SUBGHZ_ITEMS` (affiche la bande).
+const SUBGHZ_BAND_ITEM: usize = 3;
 
 fn draw_subghz_menu<D>(display: &mut D, selected: usize, band: subghz::Band) -> anyhow::Result<()>
 where
@@ -793,7 +802,7 @@ where
             .draw(display)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
         // L'item "Changer bande" affiche la bande courante.
-        let txt = if i == 2 {
+        let txt = if i == SUBGHZ_BAND_ITEM {
             format!("Bande: {}", band.name())
         } else {
             label.to_string()
@@ -950,6 +959,10 @@ where
                     draw_subghz_menu(display, sel, cc.band)?;
                 }
                 2 => {
+                    subghz_load_screen(display, cc, btn_up, btn_dwn, btn_mid, btn_lft)?;
+                    draw_subghz_menu(display, sel, cc.band)?;
+                }
+                3 => {
                     let idx = subghz::BANDS
                         .iter()
                         .position(|&b| b == cc.band)
@@ -965,6 +978,245 @@ where
         }
         FreeRtos::delay_ms(20);
     }
+    Ok(())
+}
+
+/// Scanne `/sdcard/subghz` puis `/spiflash/subghz` pour les fichiers `.sub`
+/// (déposés via le file browser web). Même logique que `collect_saved_dumps` :
+/// dédup par nom (SD prioritaire) puis tri. Retourne (nom_affiché, chemin).
+fn collect_sub_files() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for root in ["/sdcard", "/spiflash"] {
+        let dir = format!("{root}/subghz");
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.to_ascii_lowercase().ends_with(".sub") {
+                continue;
+            }
+            if out.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            let path = format!("{dir}/{name}");
+            out.push((name, path));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    log::info!("collect_sub_files: {} fichier(s) .sub", out.len());
+    out
+}
+
+/// Écran de chargement/replay des `.sub` : liste → MID ouvre → émet via FIFO.
+///
+/// Le replay fidèle du RAW exige GDO0+RMT ; ici on émet en FIFO OOK, fidèle pour
+/// les protocoles décodés (Princeton…) et approximatif pour le RAW arbitraire.
+fn subghz_load_screen<D>(
+    display: &mut D,
+    cc: &mut subghz::Cc1101,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let entries = collect_sub_files();
+    if entries.is_empty() {
+        draw_nfc_status(display, "Aucun .sub\n(dossier subghz/)")?;
+        loop {
+            if btn_lft.is_low() || btn_mid.is_low() {
+                while btn_lft.is_low() || btn_mid.is_low() {
+                    FreeRtos::delay_ms(10);
+                }
+                break;
+            }
+            FreeRtos::delay_ms(20);
+        }
+        return Ok(());
+    }
+    let files: Vec<String> = entries.iter().map(|(n, _)| n.clone()).collect();
+
+    let mut sel = 0usize;
+    draw_sub_list(display, &files, sel)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = if sel == 0 { files.len() - 1 } else { sel - 1 };
+            draw_sub_list(display, &files, sel)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = (sel + 1) % files.len();
+            draw_sub_list(display, &files, sel)?;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            replay_sub_file(display, cc, &entries[sel].1, btn_mid, btn_lft)?;
+            draw_sub_list(display, &files, sel)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+/// Parse un `.sub`, affiche ses infos puis émet sur MID (LFT pour revenir).
+fn replay_sub_file<D>(
+    display: &mut D,
+    cc: &mut subghz::Cc1101,
+    path: &str,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    use axolotl_core::subghz::{Protocol, SubFile};
+
+    let Ok(text) = std::fs::read_to_string(path) else {
+        draw_nfc_status(display, "Lecture KO")?;
+        FreeRtos::delay_ms(1500);
+        return Ok(());
+    };
+    let sub = match SubFile::parse(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("parse .sub: {e}");
+            draw_nfc_status(display, "Parse .sub KO")?;
+            FreeRtos::delay_ms(1500);
+            return Ok(());
+        }
+    };
+    // Une seule trame ; les répétitions sont gérées à l'émission (cf. plus bas).
+    let timings = match sub.to_timings(1) {
+        Ok(t) if !t.is_empty() => t,
+        _ => {
+            draw_nfc_status(display, "Non rejouable\n(rolling code ?)")?;
+            FreeRtos::delay_ms(1800);
+            return Ok(());
+        }
+    };
+    // chip = quantum d'émission FIFO ; repeat = nb de trames envoyées.
+    let (chip_us, repeat, proto): (u32, u8, &str) = match &sub.protocol {
+        Protocol::Princeton { te_us, .. } => (*te_us, 8, "Princeton"),
+        Protocol::Raw { .. } => {
+            let min = timings
+                .iter()
+                .map(|t| t.unsigned_abs())
+                .filter(|&d| d > 0)
+                .min()
+                .unwrap_or(100);
+            (min.clamp(50, 250), 3, "RAW")
+        }
+        Protocol::Unsupported(_) => (100, 1, "?"),
+    };
+
+    let info = format!(
+        "{:.3} MHz\n{}  {} fronts\nMID: emettre\nLFT: retour",
+        sub.frequency_hz as f32 / 1_000_000.0,
+        proto,
+        timings.len()
+    );
+    draw_nfc_status(display, &info)?;
+
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            draw_nfc_status(display, "Emission...")?;
+            // Règle la fréquence exacte du fichier avant d'émettre.
+            let msg = match cc
+                .set_frequency_hz(sub.frequency_hz)
+                .and_then(|_| cc.transmit_timings(&timings, chip_us, repeat))
+            {
+                Ok(_) => "Emis",
+                Err(e) => {
+                    log::warn!("replay .sub: {e:?}");
+                    "Emission KO"
+                }
+            };
+            // Restaure la fréquence de la bande affichée au menu.
+            let band = cc.band;
+            let _ = cc.set_band(band);
+            draw_nfc_status(display, msg)?;
+            FreeRtos::delay_ms(1200);
+            draw_nfc_status(display, &info)?;
+        }
+        FreeRtos::delay_ms(30);
+    }
+    Ok(())
+}
+
+fn draw_sub_list<D>(display: &mut D, files: &[String], sel: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+
+    Text::with_text_style(
+        "FICHIERS .SUB",
+        Point::new(120, 28),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    const VISIBLE: usize = 7;
+    let start = if sel >= VISIBLE { sel - VISIBLE + 1 } else { 0 };
+    for (row, idx) in (start..files.len().min(start + VISIBLE)).enumerate() {
+        let y = 60 + row as i32 * 22;
+        // Tronque le nom (sans l'extension) pour tenir à l'écran.
+        let stem = files[idx].strip_suffix(".sub").unwrap_or(&files[idx]);
+        let stem: String = stem.chars().take(18).collect();
+        let (prefix, color) = if idx == sel {
+            ("> ", GREEN)
+        } else {
+            ("  ", GRAY)
+        };
+        Text::with_text_style(
+            &format!("{prefix}{stem}"),
+            Point::new(120, y),
+            MonoTextStyle::new(&FONT_10X20, color),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    Text::with_text_style(
+        "MID:ouvrir  UP/DN:nav  LFT:retour",
+        Point::new(120, 228),
+        MonoTextStyle::new(&FONT_6X10, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Ok(())
 }
 
