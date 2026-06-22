@@ -12,6 +12,7 @@ pub mod keys;
 pub mod layout;
 pub mod mfd;
 pub mod protocol;
+pub mod subghz;
 
 pub use card::NfcUid;
 pub use dump::MifareDump;
