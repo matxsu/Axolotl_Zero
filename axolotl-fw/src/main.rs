@@ -27,6 +27,7 @@ use storage::SdWrite;
 mod logo;
 mod nfc;
 mod storage;
+mod subghz;
 mod wifi;
 
 const BG: Rgb565 = Rgb565::new(1, 4, 2);
@@ -155,6 +156,28 @@ fn run_app() -> anyhow::Result<()> {
     )?;
     let mut pn532 = nfc::Pn532::new(i2c)?;
 
+    // ── CC1101 Sub-GHz : CS=7, MODE_0, partage le SPI2 (display + SD) ─────────
+    // Non-fatal comme la SD : si le module est absent/non câblé, check_present()
+    // échoue (MISO flottant → PARTNUM != 0x00) → None, et le boot continue.
+    // Important vu la flakiness d'alim au boot : un module Sub-GHz manquant ne
+    // doit jamais bloquer le device.
+    let mut cc1101: Option<subghz::Cc1101> =
+        match subghz::Cc1101::new(&spi_driver, peripherals.pins.gpio7.into()) {
+            Ok(mut cc) => {
+                if cc.check_present() {
+                    log::info!("CC1101: present");
+                    Some(cc)
+                } else {
+                    log::warn!("CC1101: non detecte — Sub-GHz desactive");
+                    None
+                }
+            }
+            Err(e) => {
+                log::warn!("CC1101 init: {:?} — Sub-GHz desactive", e);
+                None
+            }
+        };
+
     // ── WiFi AP + serveur HTTP (non-fatal : SD browser web) ──────────────────
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
@@ -275,6 +298,14 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_up,
                     &btn_dwn,
                     &btn_rht,
+                )?,
+                1 => run_subghz(
+                    &mut display,
+                    cc1101.as_mut(),
+                    &btn_up,
+                    &btn_dwn,
+                    &btn_mid,
+                    &btn_lft,
                 )?,
                 3 => run_storage_browser(
                     &mut display,
@@ -719,6 +750,217 @@ where
                     draw_attack_menu(display, sel)?;
                 }
                 1 | _ => break,
+            }
+        }
+        FreeRtos::delay_ms(20);
+    }
+    Ok(())
+}
+
+// ── Sub-GHz (CC1101) ────────────────────────────────────────────────────────
+
+const SUBGHZ_ITEMS: &[&str] = &["Scan RSSI", "TX Princeton test", "Changer bande", "Retour"];
+
+fn draw_subghz_menu<D>(display: &mut D, selected: usize, band: subghz::Band) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(
+        "SUB-GHZ",
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    for (i, label) in SUBGHZ_ITEMS.iter().enumerate() {
+        let y = 42 + i as i32 * 44;
+        let (bg, fg) = if i == selected {
+            (ORANGE, BLACK)
+        } else {
+            (BG, WHITE)
+        };
+        Rectangle::new(Point::new(10, y), Size::new(220, 36))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        // L'item "Changer bande" affiche la bande courante.
+        let txt = if i == 2 {
+            format!("Bande: {}", band.name())
+        } else {
+            label.to_string()
+        };
+        Text::new(
+            &txt,
+            Point::new(20, y + 24),
+            MonoTextStyle::new(&FONT_10X20, fg),
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+/// Écran spectre : scan RSSI ±1 MHz autour de la bande, rafraîchi en continu.
+/// LEFT pour sortir.
+fn subghz_scan_screen<D>(
+    display: &mut D,
+    cc: &mut subghz::Cc1101,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        let scan = cc.scan_rssi(20, 100).unwrap_or_default();
+        let peak = scan.iter().map(|(_, d)| *d).max().unwrap_or(-120);
+
+        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::with_text_style(
+            &format!("{}  pic {}dBm", cc.band.name(), peak),
+            Point::new(120, 18),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+        // Barres : RSSI -110..-20 dBm → hauteur 0..170 px (base à y=210).
+        let n = scan.len().max(1) as i32;
+        let bar_w = (240 / n).max(1);
+        for (i, (_off, dbm)) in scan.iter().enumerate() {
+            let h = (((*dbm as i32) + 110).clamp(0, 90) * 170 / 90).max(1);
+            let x = i as i32 * bar_w;
+            Rectangle::new(
+                Point::new(x, 210 - h),
+                Size::new((bar_w - 1).max(1) as u32, h as u32),
+            )
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(GREEN).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+        Text::with_text_style(
+            "LEFT: retour",
+            Point::new(120, 230),
+            MonoTextStyle::new(&FONT_6X10, GRAY),
+            centered,
+        )
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        FreeRtos::delay_ms(60);
+    }
+    Ok(())
+}
+
+fn run_subghz<D>(
+    display: &mut D,
+    cc: Option<&mut subghz::Cc1101>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let cc = match cc {
+        Some(c) => c,
+        None => {
+            draw_nfc_status(display, "CC1101 absent\nverif cablage")?;
+            loop {
+                if btn_lft.is_low() || btn_mid.is_low() {
+                    while btn_lft.is_low() || btn_mid.is_low() {
+                        FreeRtos::delay_ms(10);
+                    }
+                    break;
+                }
+                FreeRtos::delay_ms(20);
+            }
+            return Ok(());
+        }
+    };
+
+    let mut sel = 0usize;
+    draw_subghz_menu(display, sel, cc.band)?;
+    loop {
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            break;
+        }
+        if btn_up.is_low() {
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            sel = sel.saturating_sub(1);
+            draw_subghz_menu(display, sel, cc.band)?;
+        }
+        if btn_dwn.is_low() {
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            if sel < SUBGHZ_ITEMS.len() - 1 {
+                sel += 1;
+            }
+            draw_subghz_menu(display, sel, cc.band)?;
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            match sel {
+                0 => {
+                    subghz_scan_screen(display, cc, btn_lft)?;
+                    draw_subghz_menu(display, sel, cc.band)?;
+                }
+                1 => {
+                    // Code Princeton de test (24 bits) — cadencé par le CC1101 (FIFO),
+                    // donc fiable contrairement à une capture polling.
+                    draw_nfc_status(display, "TX Princeton...")?;
+                    let bits: [u8; 24] = [
+                        1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 0, 1, 0, 0, 1, 1, 0, 1, 0,
+                    ];
+                    let msg = match cc.send_princeton(&bits, 350, 8) {
+                        Ok(_) => "TX envoye",
+                        Err(e) => {
+                            log::warn!("Sub-GHz TX: {:?}", e);
+                            "TX echec"
+                        }
+                    };
+                    draw_nfc_status(display, msg)?;
+                    FreeRtos::delay_ms(1500);
+                    draw_subghz_menu(display, sel, cc.band)?;
+                }
+                2 => {
+                    let idx = subghz::BANDS
+                        .iter()
+                        .position(|&b| b == cc.band)
+                        .unwrap_or(0);
+                    let next = subghz::BANDS[(idx + 1) % subghz::BANDS.len()];
+                    if let Err(e) = cc.set_band(next) {
+                        log::warn!("Sub-GHz set_band: {:?}", e);
+                    }
+                    draw_subghz_menu(display, sel, cc.band)?;
+                }
+                _ => break,
             }
         }
         FreeRtos::delay_ms(20);
