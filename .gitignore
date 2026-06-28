@@ -1,0 +1,7 @@
+﻿.embuild/
+target/
+build/
+managed_components/
+sdkconfig.old
+*.pyc
+__pycache__/

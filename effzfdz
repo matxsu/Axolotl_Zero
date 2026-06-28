@@ -1,0 +1,28 @@
+[package]
+name = "fz"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fz"
+path = "src/main.rs"
+
+[dependencies]
+esp-idf-svc = "0.52"
+log = "0.4"
+anyhow = "1"
+
+[build-dependencies]
+embuild = "0.33"
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/esp_tinyusb", version = "^1.4.0" }
+bindings_header = "tusb_bindings.h"
+bindings_module = "tinyusb"
