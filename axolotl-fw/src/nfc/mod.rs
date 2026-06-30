@@ -40,6 +40,22 @@ const CMD_RF_CONFIGURATION: u8 = 0x32;
 const CMD_TG_INIT_AS_TARGET: u8 = 0x8C;
 const CMD_TG_GET_DATA: u8 = 0x86;
 const CMD_TG_SET_DATA: u8 = 0x8E;
+const CMD_WRITE_REGISTER: u8 = 0x08;
+
+// ── Registres CIU (PN53x) — adresses depuis libnfc chips/pn53x-internal.h ────
+// Pilotage bas niveau du CRC et du bit-framing pour parler à la backdoor des
+// cartes magic gen1a : le réveil 0x40 DOIT partir en trame courte 7 bits, CRC
+// désactivé. InCommunicateThru envoie sinon un octet complet + CRC-A, que la
+// carte gen1a ignore → détection « non-magic » à tort.
+const REG_CIU_TX_MODE: u16 = 0x6302; // bit7 = TxCRCEn
+const REG_CIU_RX_MODE: u16 = 0x6303; // bit7 = RxCRCEn
+const REG_CIU_BIT_FRAMING: u16 = 0x633D; // bits[2:0] = TxLastBits
+
+// Cartes gen1a bas coût : l'écriture (et parfois le réveil) n'ACK souvent qu'au
+// 2e/3e essai. Le fournisseur T4U le documente lui-même (« ce message d'erreur
+// est normal, recommencez jusqu'à réussite »). On retente donc en boucle.
+const GEN1A_UNLOCK_TRIES: u8 = 4;
+const GEN1A_WRITE_TRIES: u8 = 4;
 
 // ── Framing ────────────────────────────────────────────────────────────────
 const PREAMBLE: u8 = 0x00;
@@ -237,6 +253,115 @@ impl<'d> Pn532<'d> {
             result.push(b).ok();
         }
         Ok((status, result))
+    }
+
+    // ── Pilotage CIU bas niveau (CRC / bit-framing) pour backdoor gen1a ────
+
+    /// PN532 WriteRegister (UM0701-02 §7.2.7) — écrit des paires (adresse,
+    /// valeur) dans l'espace registre du CIU. Seule voie pour émettre la trame
+    /// courte 7 bits exigée par le réveil 0x40 d'une carte magic gen1a.
+    fn write_register(&mut self, regs: &[(u16, u8)]) -> anyhow::Result<()> {
+        let mut params: heapless::Vec<u8, 48> = heapless::Vec::new();
+        for &(addr, val) in regs {
+            params.push((addr >> 8) as u8).ok();
+            params.push((addr & 0xFF) as u8).ok();
+            params.push(val).ok();
+        }
+        self.send_frame(CMD_WRITE_REGISTER, &params)?;
+        self.read_ack()?;
+        self.read_response(CMD_WRITE_REGISTER)?;
+        Ok(())
+    }
+
+    /// Active (ON) ou coupe (OFF) le CRC TX+RX du CIU. OFF pour dialoguer avec
+    /// la backdoor gen1a (0x40/0x43) ; ON pour les commandes MIFARE normales (le
+    /// CIU ajoute alors le CRC-A). 0x80/0x00 = défaut 106 kbps Type A ±CRC ; de
+    /// toute façon le prochain InListPassiveTarget reconfigure ces registres.
+    fn set_crc(&mut self, on: bool) {
+        let v = if on { 0x80 } else { 0x00 };
+        if let Err(e) = self.write_register(&[(REG_CIU_TX_MODE, v), (REG_CIU_RX_MODE, v)]) {
+            log::warn!("set_crc({}): WriteRegister KO: {:?}", on, e);
+        }
+    }
+
+    /// Règle TxLastBits : 7 pour la trame courte du réveil gen1a (0x40), 0 =
+    /// octet complet (cas par défaut).
+    fn set_tx_last_bits(&mut self, bits: u8) {
+        if let Err(e) = self.write_register(&[(REG_CIU_BIT_FRAMING, bits & 0x07)]) {
+            log::warn!("set_tx_last_bits({}): WriteRegister KO: {:?}", bits, e);
+        }
+    }
+
+    /// Ouvre la backdoor d'une carte magic **gen1a**.
+    ///
+    /// Séquence canonique (libnfc `utils/nfc-mfclassic.c::unlock_card`) :
+    ///   HALT (0x50 0x00 + CRC) → 0x40 en **trame 7 bits, CRC OFF** → ACK 0x0A
+    ///   → 0x43 **octet plein, CRC OFF** → ACK 0x0A.
+    /// Laisse le CIU **CRC ON** en sortie (état requis par les WRITE 0xA0 qui
+    /// suivent). La carte doit déjà être sélectionnée (InListPassiveTarget fait
+    /// par l'appelant). Réessaie `GEN1A_UNLOCK_TRIES` fois.
+    ///
+    /// Loggue les réponses brutes 0x40/0x43 : c'est le seul moyen de distinguer,
+    /// au prochain flash, « mauvaise adresse registre » de « carte muette ».
+    fn gen1a_unlock(&mut self) -> bool {
+        for attempt in 1..=GEN1A_UNLOCK_TRIES {
+            // HALT avec CRC : place la carte en état HALT, où le réveil l'attend.
+            self.set_crc(true);
+            self.set_tx_last_bits(0);
+            let _ = self.in_communicate_thru_relaxed(&[0x50, 0x00]); // pas de réponse
+
+            // Réveil 0x40 : trame courte 7 bits, CRC coupé.
+            self.set_crc(false);
+            self.set_tx_last_bits(7);
+            let r40 = self.in_communicate_thru_relaxed(&[0x40]);
+            self.set_tx_last_bits(0);
+            let ok40 = matches!(r40, Ok((_, ref d)) if d.first() == Some(&0x0A));
+            log::info!(
+                "gen1a unlock {}/{} : 0x40 -> {:?}",
+                attempt,
+                GEN1A_UNLOCK_TRIES,
+                r40
+            );
+            if !ok40 {
+                self.set_crc(true);
+                self.re_select();
+                continue;
+            }
+
+            // 0x43 : octet plein, CRC toujours coupé.
+            let r43 = self.in_communicate_thru_relaxed(&[0x43]);
+            let ok43 = matches!(r43, Ok((_, ref d)) if d.first() == Some(&0x0A));
+            log::info!(
+                "gen1a unlock {}/{} : 0x43 -> {:?}",
+                attempt,
+                GEN1A_UNLOCK_TRIES,
+                r43
+            );
+            self.set_crc(true); // restaure CRC pour la phase WRITE 0xA0
+            if ok43 {
+                log::info!("gen1a backdoor ouverte (essai {})", attempt);
+                return true;
+            }
+            self.re_select();
+        }
+        false
+    }
+
+    /// Écrit un bloc via la backdoor gen1a **déjà ouverte** (WRITE 0xA0 + 16
+    /// octets, CRC ON ajouté par le CIU). Réessaie `GEN1A_WRITE_TRIES` fois : ces
+    /// cartes ACK souvent au 2e/3e essai seulement.
+    fn gen1a_write_block(&mut self, blk: u8, data: &[u8; 16]) -> bool {
+        for _ in 0..GEN1A_WRITE_TRIES {
+            let a1 = self.in_communicate_thru_relaxed(&[0xA0, blk]);
+            if !matches!(a1, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+                continue;
+            }
+            let a2 = self.in_communicate_thru_relaxed(data);
+            if matches!(a2, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+                return true;
+            }
+        }
+        false
     }
 
     // ── API publique — scan ───────────────────────────────────────────────
@@ -554,12 +679,11 @@ impl<'d> Pn532<'d> {
         self.re_select();
 
         if !block0_writable {
-            // Fallback gen1a : 0x40 → ACK 0x0A = backdoor disponible.
-            // Après re_select (ligne précédente), la carte est en état ACTIVE.
-            log::info!("Clone gen2 KO — test backdoor gen1a (0x40)");
-            let ack40 = self.in_communicate_thru_relaxed(&[0x40]);
-            if matches!(ack40, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
-                log::info!("Clone : ACK gen1a recu — clone gen1a en cours");
+            // Fallback gen1a : ouvre la backdoor (HALT → 0x40 7-bit CRC-off →
+            // 0x43). Après le re_select précédent la carte est sélectionnée.
+            log::info!("Clone gen2 KO — tentative backdoor gen1a");
+            if self.gen1a_unlock() {
+                log::info!("Clone : backdoor gen1a ouverte — clone en cours");
                 return self.clone_gen1a_unlocked(dump, keys, reversible, on_sector);
             }
             log::warn!("Clone ANNULE : cible non-magic (ni gen2 ni gen1a) — rien ecrit");
@@ -716,27 +840,18 @@ impl<'d> Pn532<'d> {
         Ok((dump, keys))
     }
 
-    /// Wipe gen1a : efface tous les blocs via le backdoor 0x40 sans auth.
+    /// Wipe gen1a : efface tous les blocs via le backdoor 0x40/0x43 sans auth.
     ///
-    /// Séquence : 0x40 → ACK 0x0A, 0x43 → ACK 0x0A, puis WRITE (0xA0)
-    /// bloc par bloc via InCommunicateThru (CRC-A appended par le CIU).
+    /// Ouvre la backdoor via [`Self::gen1a_unlock`] (HALT → 0x40 7-bit CRC-off →
+    /// 0x43), puis WRITE (0xA0) bloc par bloc (CRC-A ajouté par le CIU), avec
+    /// retries (`gen1a_write_block`).
     /// Trailers → transport state : `FF FF FF FF FF FF FF 07 80 69 FF FF FF FF FF FF`
     /// Blocs data → 16 zéros (sauf bloc 0 conservé tel quel pour ne pas bricker l'UID).
     ///
     /// Retourne (blocs_effacés, blocs_total).
     pub fn wipe_gen1a<F: FnMut(u8, u8)>(&mut self, mut on_block: F) -> (u8, u8) {
-        // Ouvre le backdoor
-        let unlock1 = self.in_communicate_thru_relaxed(&[0x40]);
-        let ok1 = matches!(unlock1, Ok((_, ref d)) if d.first() == Some(&0x0A));
-        if !ok1 {
-            log::warn!("wipe_gen1a: 0x40 ACK manquant, abandon");
-            self.reset_field();
-            return (0, 63);
-        }
-        let unlock2 = self.in_communicate_thru_relaxed(&[0x43]);
-        let ok2 = matches!(unlock2, Ok((_, ref d)) if d.first() == Some(&0x0A));
-        if !ok2 {
-            log::warn!("wipe_gen1a: 0x43 ACK manquant, abandon");
+        if !self.gen1a_unlock() {
+            log::warn!("wipe_gen1a: backdoor gen1a indisponible (0x40/0x43 sans ACK), abandon");
             self.reset_field();
             return (0, 63);
         }
@@ -752,24 +867,13 @@ impl<'d> Pn532<'d> {
                 &ZERO_BLOCK
             };
 
-            // WRITE : 0xA0 + bloc, puis 16 bytes data
-            // Le CIU ajoute CRC-A automatiquement sur chaque trame.
-            let cmd_write = [0xA0u8, blk];
-            let ack1 = self.in_communicate_thru_relaxed(&cmd_write);
-            let step1_ok = matches!(ack1, Ok((_, ref d)) if d.first() == Some(&0x0A));
-            if !step1_ok {
-                log::warn!("wipe blk{}: WRITE cmd ACK raté", blk);
-                on_block(blk, 0xFF);
-                continue;
-            }
-            let ack2 = self.in_communicate_thru_relaxed(data);
-            let step2_ok = matches!(ack2, Ok((_, ref d)) if d.first() == Some(&0x0A));
-            if step2_ok {
+            // WRITE 0xA0 + 16 octets, avec retries (CRC-A ajouté par le CIU).
+            if self.gen1a_write_block(blk, data) {
                 written += 1;
                 log::info!("wipe blk{}: OK", blk);
                 on_block(blk, 0x00);
             } else {
-                log::warn!("wipe blk{}: data ACK raté", blk);
+                log::warn!("wipe blk{}: ecriture KO apres {} essais", blk, GEN1A_WRITE_TRIES);
                 on_block(blk, 0xFF);
             }
         }
@@ -953,8 +1057,8 @@ impl<'d> Pn532<'d> {
         self.mifare_write_block(block, data).is_ok()
     }
 
-    /// Clone un dump vers une carte gen1a via le backdoor 0x40/0x43 (le premier
-    /// octet 0x40 a déjà été envoyé et a reçu ACK 0x0A par l'appelant).
+    /// Clone un dump vers une carte gen1a, **backdoor déjà ouverte** par
+    /// [`Self::gen1a_unlock`] (0x40/0x43 ACK'd, CRC restauré ON par l'appelant).
     ///
     /// Le backdoor bypass l'authentification MIFARE → tous les blocs (y compris
     /// le bloc 0 / UID) sont accessibles en écriture directe via WRITE (0xA0).
@@ -965,15 +1069,8 @@ impl<'d> Pn532<'d> {
         reversible: bool,
         mut on_sector: F,
     ) -> anyhow::Result<(u32, bool)> {
-        // Finalise le backdoor (0x40 était déjà envoyé et ACK'd).
-        let ack43 = self.in_communicate_thru_relaxed(&[0x43]);
-        if !matches!(ack43, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
-            log::warn!("clone_gen1a: 0x43 ACK manquant");
-            self.reset_field();
-            return Err(anyhow::anyhow!("gen1a backdoor: pas d'ACK sur 0x43"));
-        }
         log::info!(
-            "clone_gen1a: backdoor ouvert — {} blocs a ecrire",
+            "clone_gen1a: backdoor ouverte — {} blocs a ecrire",
             dump.card_type.block_count()
         );
 
@@ -996,21 +1093,18 @@ impl<'d> Pn532<'d> {
                 dump.blocks[blk as usize]
             };
 
-            // WRITE : 0xA0 + bloc, puis 16 bytes. CRC-A ajouté par le CIU.
-            let cmd_write = [0xA0u8, blk];
-            let ack1 = self.in_communicate_thru_relaxed(&cmd_write);
-            if !matches!(ack1, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
-                log::warn!("clone_gen1a blk{:03}: WRITE cmd ACK rate", blk);
-                continue;
-            }
-            let ack2 = self.in_communicate_thru_relaxed(&data);
-            if matches!(ack2, Ok((_, ref d)) if d.first() == Some(&0x0A)) {
+            // WRITE 0xA0 + 16 octets, avec retries (CRC-A ajouté par le CIU).
+            if self.gen1a_write_block(blk, &data) {
                 written += 1;
                 if blk == 0 {
                     block0_written = true;
                 }
             } else {
-                log::warn!("clone_gen1a blk{:03}: data ACK rate", blk);
+                log::warn!(
+                    "clone_gen1a blk{:03}: ecriture KO apres {} essais",
+                    blk,
+                    GEN1A_WRITE_TRIES
+                );
             }
         }
 
