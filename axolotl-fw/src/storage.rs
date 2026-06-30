@@ -28,7 +28,12 @@ pub struct SdStorage<'d, T = SpiDriver<'d>>
 where
     T: Borrow<SpiDriver<'d>> + 'd,
 {
-    _fatfs: Fatfs<SdCardDriver<SdSpiHostDriver<'d, T>>>,
+    // La Fatfs SD doit être ENREGISTRÉE dans le VFS (`esp_vfs_fat_register`) pour
+    // que `/sdcard` existe côté `std::fs`. `Fatfs::new_sdcard` ne fait que
+    // `ff_diskio_register_sdmmc` (couche disque), PAS le VFS — sans ce
+    // `MountedFatfs`, toute écriture `/sdcard/...` échoue en ENOENT (cf. le
+    // `failed to create whole tree` / `os error 2` observé). Idem `InternalFs`.
+    _mounted: MountedFatfs<Fatfs<SdCardDriver<SdSpiHostDriver<'d, T>>>>,
 }
 
 impl<'d, T> SdStorage<'d, T>
@@ -58,11 +63,15 @@ where
         log::info!("SD: carte detectee");
 
         let fatfs = Fatfs::new_sdcard(0, sd_card)?;
+        // Enregistre le FS dans le VFS à /sdcard (comme InternalFs pour /spiflash) :
+        // c'est CE montage qui crée le chemin `/sdcard` pour std::fs.
+        let mounted = MountedFatfs::mount(fatfs, MOUNT_POINT, 4)
+            .map_err(|e| anyhow::anyhow!("SD VFS mount {}: {:?}", MOUNT_POINT, e))?;
         log::info!("SD: FAT monte sur {}", MOUNT_POINT);
 
         let _ = fs::create_dir_all("/sdcard/NFC/dumps");
 
-        Ok(Self { _fatfs: fatfs })
+        Ok(Self { _mounted: mounted })
     }
 
     /// Écrit `data` dans `/sdcard{path}` (crée ou écrase).
