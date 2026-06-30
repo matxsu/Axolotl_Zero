@@ -256,23 +256,37 @@ main                          stable, démontrable, tags de release
 6. **Patchs `git` dans Cargo.toml** — actuellement mélange `crates.io` et
    `patch.crates-io` sur `esp-idf-*`. Homogénéiser avant la release.
 
+7. **Backdoor gen1a = trame 7 bits, CRC OFF** — le réveil `0x40` d'une carte
+   magic gen1a ne passe PAS par un `InCommunicateThru` brut (octet complet +
+   CRC-A, ignoré par la carte). Il faut piloter le CIU via `WriteRegister`
+   (cmd 0x08) : CRC off (`TxMode 0x6302` / `RxMode 0x6303` = 0x00) + 7 bits
+   (`BitFraming 0x633D` = 7) AVANT le `0x40`, puis restaurer CRC ON pour les
+   WRITE `0xA0`. Séquence dans `nfc/mod.rs::gen1a_unlock` (réf. libnfc
+   `nfc-mfclassic.c::unlock_card`).
+
+8. **SD à monter dans le VFS, pas juste `Fatfs::new_sdcard`** — `new_sdcard`
+   n'enregistre que la couche disque (`ff_diskio_register_sdmmc`), pas le VFS.
+   Sans `io::vfs::MountedFatfs::mount(fatfs, "/sdcard", N)`, `/sdcard` n'existe
+   pas pour `std::fs` → toute écriture échoue (`failed to create whole tree` /
+   `os error 2`). Cf. `storage.rs::SdStorage` (même pattern qu'`InternalFs`).
+
 ---
 
 ## Features implémentées / à faire
 
-> État réel au 21 juin 2026. Ne PAS sur-vendre : « émulation » et « Sub-GHz »
+> État réel au 30 juin 2026. Ne PAS sur-vendre : « émulation » et « Sub-GHz »
 > sont écrits mais non validés sur matériel — voir les notes.
 
 | Module | État | Détails |
 |---|---|---|
 | **UI menu** | ✅ OK | Menu 5-way, tous les écrans (monolithique dans `main.rs`) |
 | **Display ST7789** | ✅ OK | 240x240, splash logo |
-| **Storage FAT** | ✅ OK | SD card + fallback flash interne `/spiflash`, scan des 2 racines |
+| **Storage FAT** | ✅ OK | SD card (montée VFS `/sdcard` via `MountedFatfs`) + flash interne `/spiflash`, scan des 2 racines. ⚠️ Sauvegarde `.mfd` était cassée (SD jamais montée dans le VFS) → corrigée, voir piège #8 |
 | **NFC — UID scan + ATQA/SAK** | ✅ OK | `read_uid`, type carte remonté |
 | **NFC — MIFARE auth/read** | ✅ OK | `InDataExchange` (KeyA/KeyB) |
 | **NFC — Dump dict complet** | ✅ OK | 238 clés, cache clés Phase 0 (badge monoclé ~12 s) |
-| **NFC — Clone magic** | ✅ OK | gen2/CUID (write bloc 0) + fallback gen1a (backdoor 0x40) ; garde-fou non-magic anti-brick |
-| **NFC — Wipe gen1a** | ✅ OK | Efface une carte magic via backdoor |
+| **NFC — Clone magic** | ✅ OK | gen2/CUID (write bloc 0, **validé** sur cartes T4U) + fallback gen1a (backdoor 0x40 via framing CIU 7-bit/CRC-off, **non validé** faute de vraie gen1a — les T4U « Gen 1a » sont en fait gen2/CUID) ; garde-fou non-magic anti-brick. Voir piège #7 |
+| **NFC — Wipe gen1a** | ✅ OK | Remise à blanc gen1a (backdoor) **et** gen2/CUID (auth secteur par secteur, validé). Backdoor gen1a via `gen1a_unlock` (framing CIU), non exercé sur vraie gen1a |
 | **NFC — Émulation Crypto1** | ⚠️ Implémentée, NON vérifiée | Crypto1 logiciel côté ESP32 ; échoue souvent sur lecteur réel (timing PN532) |
 | **NFC — Darkside / Nested / PRNG** | ❌ Retirées | Le PN532 (I²C) ne permet pas le bit-timing → Proxmark3 requis |
 | **Wi-Fi — AP + file browser web** | ✅ OK | SoftAP `AxolotlZero`, serveur HTTP, IP `192.168.71.1` |
