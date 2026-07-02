@@ -26,21 +26,25 @@ fait **pas** tourner de PHP.
 ## Générer des portails depuis zphisher
 
 ```bash
-# 1. Récupérer zphisher (templates dans .sites/)
-git clone https://github.com/htr-tech/zphisher
+# 1. Récupérer le fork Evil_Rogue_AP (templates zphisher dans zphisher/.sites/)
+git clone https://github.com/matxsu/Evil_Rogue_AP
 
 # 2. Convertir vers le format SD (monte ta SD d'abord)
-tools/zphisher_to_sd.sh ~/zphisher/.sites  /run/media/$USER/AXOLOTL/portals
+tools/zphisher_to_sd.sh ~/Evil_Rogue_AP/zphisher/.sites  /run/media/$USER/AXOLOTL/portals
 
 # 3. Vérifier chaque index.html : form action="/login" method="POST",
 #    champs name="email" / name="password" (le script fait le gros du travail,
 #    mais les templates zphisher varient — ajuste si besoin).
 ```
 
-Le script réécrit l'`action`/`method` du formulaire et renomme les champs
-courants (`username`, `user`, `pass`, `passwd`…) en `email`/`password`, et copie
-les assets locaux. Les CSS/JS servis par CDN peuvent ne pas charger hors-ligne :
-le formulaire de login, lui, fonctionne.
+Le script réécrit l'`action`/`method` du formulaire, renomme les champs courants
+(`username`, `user`, `pass`, `passwd`…) en `email`/`password`, et copie **tous**
+les assets (images, css, js, sous-dossiers) récursivement.
+
+Côté firmware, l'evil-twin sert `index.html` **et** ces assets (handler `/*`
+depuis `/sdcard/portals/<site>/`) → fonds, logos et styles locaux s'affichent.
+Seuls les assets servis par CDN externe ne chargent pas hors-ligne. Le handler
+`/login` accepte aussi bien `email` que `username`.
 
 ## Sur le device
 
