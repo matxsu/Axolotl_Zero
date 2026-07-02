@@ -156,8 +156,13 @@ impl Keyboard {
 
     fn write(&mut self, text: &str) {
         for ch in text.as_bytes() {
-            self.press(*ch);
-            self.release();
+            // Garde : ASCII_MAP fait 128 entrées. Un octet ≥128 (accent dans un
+            // payload) provoquerait un index out-of-bounds → on l'ignore.
+            let c = *ch as usize;
+            if c < ASCII_MAP.len() && ASCII_MAP[c] != 0 {
+                self.press(*ch);
+                self.release();
+            }
         }
     }
 
@@ -195,6 +200,114 @@ impl Keyboard {
         self.input_keyboard.lock().set_value(&bytes).notify();
         esp_idf_svc::hal::delay::Ets::delay_ms(7);
     }
+
+    /// Interprète un script **DuckyScript** (sous-ensemble) et le tape.
+    /// Commandes : `REM`, `DELAY ms`, `DEFAULTDELAY ms`, `STRING txt`,
+    /// `STRINGLN txt`, touches nommées (`ENTER`, `TAB`, `GUI r`, `CTRL ALT DEL`,
+    /// `F1`..`F12`, flèches…). `back` interrompt entre deux commandes.
+    fn run_ducky(&mut self, script: &str, back: &PinDriver<'_, Input>) {
+        use esp_idf_svc::hal::delay::FreeRtos;
+        let mut default_delay = 0u32;
+        for raw in script.lines() {
+            if back.is_low() {
+                info!("BadUSB: payload interrompu (retour)");
+                return;
+            }
+            let line = raw.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (cmd, arg) = match line.split_once(char::is_whitespace) {
+                Some((c, a)) => (c, a.trim_start()),
+                None => (line, ""),
+            };
+            match cmd.to_ascii_uppercase().as_str() {
+                "REM" => {}
+                "DELAY" => {
+                    if let Ok(ms) = arg.trim().parse::<u32>() {
+                        FreeRtos::delay_ms(ms);
+                    }
+                }
+                "DEFAULTDELAY" | "DEFAULT_DELAY" => {
+                    default_delay = arg.trim().parse::<u32>().unwrap_or(0);
+                }
+                "STRING" => self.write(arg),
+                "STRINGLN" => {
+                    self.write(arg);
+                    self.press_combo(0, 0x28); // ENTER
+                }
+                // Tout le reste = touche(s) : ENTER, GUI r, CTRL ALT DEL, F5…
+                _ => self.exec_combo(line),
+            }
+            if default_delay > 0 {
+                FreeRtos::delay_ms(default_delay);
+            }
+        }
+    }
+
+    /// Exécute une ligne « touches » : accumule les modificateurs (GUI/CTRL/ALT/
+    /// SHIFT) et presse la touche finale (touche nommée ou caractère unique).
+    fn exec_combo(&mut self, line: &str) {
+        let mut mods = 0u8;
+        let mut key = 0u8;
+        for tok in line.split_whitespace() {
+            if let Some(m) = modifier_for(tok) {
+                mods |= m;
+            } else if let Some(k) = keycode_for(tok) {
+                key = k;
+            } else if tok.len() == 1 {
+                let c = tok.as_bytes()[0] as usize;
+                if c < ASCII_MAP.len() {
+                    key = ASCII_MAP[c] & !(SHIFT | ALTGR);
+                }
+            }
+        }
+        if mods != 0 || key != 0 {
+            self.press_combo(mods, key);
+        }
+    }
+}
+
+/// Bit de modificateur HID pour un mot-clé DuckyScript (sinon `None`).
+fn modifier_for(tok: &str) -> Option<u8> {
+    match tok.to_ascii_uppercase().as_str() {
+        "GUI" | "WINDOWS" | "WIN" | "META" | "COMMAND" => Some(0x08),
+        "CTRL" | "CONTROL" => Some(0x01),
+        "SHIFT" => Some(0x02),
+        "ALT" | "OPTION" => Some(0x04),
+        _ => None,
+    }
+}
+
+/// Scancode HID d'une touche nommée DuckyScript (sinon `None`).
+fn keycode_for(tok: &str) -> Option<u8> {
+    let up = tok.to_ascii_uppercase();
+    // F1..F12
+    if let Some(n) = up.strip_prefix('F').and_then(|s| s.parse::<u8>().ok()) {
+        if (1..=12).contains(&n) {
+            return Some(0x3a + (n - 1));
+        }
+    }
+    let code = match up.as_str() {
+        "ENTER" | "RETURN" => 0x28,
+        "ESC" | "ESCAPE" => 0x29,
+        "BACKSPACE" | "BACK" => 0x2a,
+        "TAB" => 0x2b,
+        "SPACE" => 0x2c,
+        "CAPSLOCK" => 0x39,
+        "INSERT" => 0x49,
+        "HOME" => 0x4a,
+        "PAGEUP" => 0x4b,
+        "DELETE" | "DEL" => 0x4c,
+        "END" => 0x4d,
+        "PAGEDOWN" => 0x4e,
+        "RIGHT" | "RIGHTARROW" => 0x4f,
+        "LEFT" | "LEFTARROW" => 0x50,
+        "DOWN" | "DOWNARROW" => 0x51,
+        "UP" | "UPARROW" => 0x52,
+        _ => return None,
+    };
+    Some(code)
 }
 
 /// Crée le clavier BLE et le renvoie (le menu peut afficher un écran avant de
@@ -203,9 +316,31 @@ pub fn make_keyboard() -> anyhow::Result<Keyboard> {
     Keyboard::new()
 }
 
-/// Attend l'appairage puis tape le payload une seule fois. `back` (bouton
-/// gauche) permet de quitter l'écran.
-pub fn run_payload(mut keyboard: Keyboard, back: &PinDriver<'_, Input>) {
+/// Répertoire des payloads DuckyScript sur la SD.
+pub const PAYLOADS_DIR: &str = "/sdcard/payloads";
+
+/// Liste les payloads `.txt` disponibles dans [`PAYLOADS_DIR`], triés.
+pub fn list_payloads() -> Vec<String> {
+    let Ok(rd) = std::fs::read_dir(PAYLOADS_DIR) else {
+        return Vec::new();
+    };
+    let mut v: Vec<String> = rd
+        .flatten()
+        .filter(|e| e.path().extension().map(|x| x.eq_ignore_ascii_case("txt")).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Chemin complet d'un payload.
+pub fn payload_path(name: &str) -> String {
+    format!("{PAYLOADS_DIR}/{name}")
+}
+
+/// Attend l'appairage puis exécute le `script` DuckyScript une fois. `back`
+/// (bouton gauche) quitte l'écran et **libère le BLE** (RAM rendue au Wi-Fi).
+pub fn run_payload(mut keyboard: Keyboard, script: &str, back: &PinDriver<'_, Input>) {
     use esp_idf_svc::hal::delay::FreeRtos;
     let mut deja_tape = false;
     loop {
@@ -214,12 +349,9 @@ pub fn run_payload(mut keyboard: Keyboard, back: &PinDriver<'_, Input>) {
         }
         if keyboard.connected() {
             if !deja_tape {
-                info!("Connecte ! Lancement du payload...");
-                keyboard.press_combo(0x08, 0x15);
-                FreeRtos::delay_ms(800);
-                keyboard.write("powershell\n");
-                FreeRtos::delay_ms(1500);
-                keyboard.write("Set-Content $HOME/Desktop/axolotl.txt 'Axolotl Zero a pris le controle'; Invoke-Item $HOME/Desktop/axolotl.txt\n");
+                info!("BadUSB: connecté — exécution du payload");
+                keyboard.run_ducky(script, back);
+                info!("BadUSB: payload terminé");
                 deja_tape = true;
             }
         } else {
