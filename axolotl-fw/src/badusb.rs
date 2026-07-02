@@ -210,7 +210,7 @@ pub fn run_payload(mut keyboard: Keyboard, back: &PinDriver<'_, Input>) {
     let mut deja_tape = false;
     loop {
         if back.is_low() {
-            return;
+            break;
         }
         if keyboard.connected() {
             if !deja_tape {
@@ -226,5 +226,16 @@ pub fn run_payload(mut keyboard: Keyboard, back: &PinDriver<'_, Input>) {
             deja_tape = false;
         }
         FreeRtos::delay_ms(500);
+    }
+
+    // Libère le contrôleur BLE + NimBLE (~100 KB) avant de rendre la main.
+    // Indispensable : sans ça, le singleton BLEDevice garde la RAM et le Wi-Fi
+    // relancé ensuite échoue en ESP_ERR_NO_MEM (crash observé sur matériel).
+    // On drop d'abord le clavier (ses handles GATT) puis on deinit le stack.
+    drop(keyboard);
+    if let Err(e) = BLEDevice::deinit() {
+        log::warn!("BadUSB: deinit BLE KO: {:?}", e);
+    } else {
+        log::info!("BadUSB: BLE deinit (RAM liberee)");
     }
 }
