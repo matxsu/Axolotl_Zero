@@ -1,0 +1,11 @@
+REM Demo inoffensive : ouvre Notepad (Windows) et tape un message.
+REM Cadre pedagogique ESGI, labo, materiel de l'equipe.
+DEFAULTDELAY 40
+DELAY 600
+GUI r
+DELAY 400
+STRING notepad
+ENTER
+DELAY 900
+STRINGLN Axolotl Zero - demonstration BadUSB (labo pedagogique)
+STRINGLN Ceci est une demo inoffensive : aucun code malveillant.

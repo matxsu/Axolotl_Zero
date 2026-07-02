@@ -46,6 +46,34 @@ depuis `/sdcard/portals/<site>/`) → fonds, logos et styles locaux s'affichent.
 Seuls les assets servis par CDN externe ne chargent pas hors-ligne. Le handler
 `/login` accepte aussi bien `email` que `username`.
 
+## Payloads BadUSB (DuckyScript sur SD)
+
+```
+/sdcard/payloads/
+├── demo_message.txt      ← exemples fournis (axolotl-fw/payloads/)
+├── demo_open_url.txt
+└── <tes_payloads>.txt    ← tes payloads de labo
+```
+
+Un fichier `.txt` = un payload **DuckyScript**. Menu **BadUSB → choisir un
+payload**, puis appairer « Axolotl Keyboard » en Bluetooth ; le device tape le
+script. Sous-ensemble supporté :
+
+| Commande | Effet |
+|---|---|
+| `REM ...` | commentaire |
+| `DELAY ms` | pause |
+| `DEFAULTDELAY ms` | pause entre chaque commande |
+| `STRING txt` | tape `txt` |
+| `STRINGLN txt` | tape `txt` + Entrée |
+| `ENTER TAB SPACE ESC BACKSPACE DELETE HOME END PAGEUP PAGEDOWN` | touches |
+| `UP DOWN LEFT RIGHT` `F1`..`F12` `CAPSLOCK` | touches |
+| `GUI/WIN/CTRL/ALT/SHIFT [touche]` | combos (ex. `GUI r`, `CTRL ALT DELETE`) |
+
+Layout clavier **AZERTY (FR)**. Cadre labo/pédagogique : le device n'est qu'un
+vecteur de frappe HID — le contenu des payloads relève de ta responsabilité et
+doit rester dans le périmètre autorisé (matériel de l'équipe, démos ESGI).
+
 ## Sur le device
 
 Menu **WiFi Tools → Evil twin** : choisir le réseau à cloner (SSID repris tel

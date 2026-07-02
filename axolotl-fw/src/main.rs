@@ -268,7 +268,7 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_dwn,
                     &btn_rht,
                 )?,
-                2 => run_badusb(&mut display, &btn_mid, &btn_lft)?,
+                2 => run_badusb(&mut display, &btn_up, &btn_dwn, &btn_mid, &btn_lft)?,
                 3 => run_storage_browser(
                     &mut display,
                     storage,
@@ -523,9 +523,63 @@ where
     Ok(())
 }
 
-/// Écran BadUSB : clavier HID BLE. Attend l'appairage puis joue le payload.
+/// Sélection générique dans une liste via le menu scrollable ([`draw_submenu`]).
+/// UP/DOWN naviguent, MID valide (renvoie l'index), gauche annule (`None`).
+#[allow(clippy::too_many_arguments)]
+fn select_from_list<D>(
+    display: &mut D,
+    title: &str,
+    items: &[&str],
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<Option<usize>>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let mut sel = 0usize;
+    draw_submenu(display, title, items, sel)?;
+    loop {
+        if btn_up.is_low() {
+            sel = if sel == 0 { items.len() - 1 } else { sel - 1 };
+            draw_submenu(display, title, items, sel)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            sel = (sel + 1) % items.len();
+            draw_submenu(display, title, items, sel)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(None);
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(Some(sel));
+        }
+        FreeRtos::delay_ms(20);
+    }
+}
+
+/// Écran BadUSB : choisir un payload DuckyScript sur SD, puis clavier HID BLE.
 fn run_badusb<D>(
     display: &mut D,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
     btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
 ) -> anyhow::Result<()>
@@ -533,9 +587,28 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
+    // 1. Choisir un payload sur SD (/sdcard/payloads/*.txt).
+    let names = badusb::list_payloads();
+    if names.is_empty() {
+        draw_wifi_info(display, "BADUSB", "Aucun payload SD", "cf /sdcard/payloads/")?;
+        while !btn_lft.is_low() && !btn_mid.is_low() {
+            FreeRtos::delay_ms(50);
+        }
+        while btn_lft.is_low() {
+            FreeRtos::delay_ms(10);
+        }
+        return Ok(());
+    }
+    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let Some(idx) = select_from_list(display, "PAYLOAD", &refs, btn_up, btn_dwn, btn_mid, btn_lft)? else {
+        return Ok(());
+    };
+    let script = std::fs::read_to_string(badusb::payload_path(&names[idx])).unwrap_or_default();
+
+    // 2. Init clavier BLE + exécution (libère le BLE à la sortie).
     draw_wifi_info(display, "BADUSB BLE", "Appairez :", "Axolotl Keyboard")?;
     match badusb::make_keyboard() {
-        Ok(kb) => badusb::run_payload(kb, btn_lft),
+        Ok(kb) => badusb::run_payload(kb, &script, btn_lft),
         Err(e) => {
             log::warn!("BadUSB: init BLE KO: {:?}", e);
             draw_wifi_info(display, "BADUSB BLE", "Erreur init BLE", "voir logs")?;

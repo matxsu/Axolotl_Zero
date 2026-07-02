@@ -1,0 +1,7 @@
+REM Demo inoffensive : ouvre une URL dans le navigateur par defaut (Windows).
+REM Illustre l'execution d'une commande via la boite Executer.
+DELAY 600
+GUI r
+DELAY 400
+STRING https://www.esgi.fr
+ENTER
