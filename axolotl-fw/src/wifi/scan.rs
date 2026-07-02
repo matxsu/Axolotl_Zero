@@ -164,3 +164,130 @@ where
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     Ok(())
 }
+
+/// Réseau choisi via [`pick`], transmis aux outils qui ciblent un AP précis
+/// (evil-twin qui clone le SSID, sniff qui vise un canal).
+#[derive(Clone)]
+pub struct ApChoice {
+    pub ssid: String,
+    pub channel: u8,
+}
+
+/// Scanne une fois puis affiche une liste **sélectionnable** de réseaux.
+/// UP/DOWN naviguent, MID valide, `back` (gauche) annule.
+/// Renvoie le réseau choisi, ou `None` si l'utilisateur annule.
+#[allow(clippy::too_many_arguments)]
+pub fn pick<D>(
+    modem: impl WifiModemPeripheral,
+    sys_loop: EspSystemEventLoop,
+    nvs: EspDefaultNvsPartition,
+    display: &mut D,
+    btn_up: &PinDriver<'_, Input>,
+    btn_dwn: &PinDriver<'_, Input>,
+    btn_mid: &PinDriver<'_, Input>,
+    back: &PinDriver<'_, Input>,
+) -> anyhow::Result<Option<ApChoice>>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    info!("=== Selection reseau (pick) ===");
+    banner(display, "Scan en cours...")?;
+    let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
+    wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
+    wifi.start()?;
+
+    // Scan unique → liste figée à naviguer (pas de re-scan pendant la sélection).
+    let reseaux = wifi.scan()?;
+    let choices: Vec<ApChoice> = reseaux
+        .iter()
+        .map(|ap| ApChoice {
+            ssid: ap.ssid.as_str().to_string(),
+            channel: ap.channel,
+        })
+        .collect();
+
+    if choices.is_empty() {
+        banner(display, "Aucun reseau trouve")?;
+        // Attend le bouton retour pour ne pas revenir instantanément.
+        while !back.is_low() {
+            FreeRtos::delay_ms(50);
+        }
+        while back.is_low() {
+            FreeRtos::delay_ms(10);
+        }
+        return Ok(None);
+    }
+
+    let mut sel = 0usize;
+    draw_pick_list(display, &choices, sel)?;
+    loop {
+        if btn_up.is_low() {
+            sel = if sel == 0 { choices.len() - 1 } else { sel - 1 };
+            draw_pick_list(display, &choices, sel)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            sel = (sel + 1) % choices.len();
+            draw_pick_list(display, &choices, sel)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if back.is_low() {
+            while back.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(None);
+        }
+        if btn_mid.is_low() {
+            while btn_mid.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            let c = choices[sel].clone();
+            info!("Reseau choisi : {} (canal {})", c.ssid, c.channel);
+            return Ok(Some(c));
+        }
+        FreeRtos::delay_ms(20);
+    }
+}
+
+/// Dessine la liste des réseaux avec fenêtre de défilement (8 lignes visibles).
+fn draw_pick_list<D>(display: &mut D, choices: &[ApChoice], selected: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    const VISIBLE: usize = 8;
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let title = format!("CIBLE  {}/{}", selected + 1, choices.len());
+    Text::new(&title, Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+
+    // Fenêtre de défilement centrée autour de la sélection.
+    let start = selected.saturating_sub(VISIBLE - 1).min(choices.len().saturating_sub(VISIBLE));
+    let mut y = 44i32;
+    for (i, c) in choices.iter().enumerate().skip(start).take(VISIBLE) {
+        let is_sel = i == selected;
+        if is_sel {
+            Rectangle::new(Point::new(4, y - 10), Size::new(232, 22))
+                .into_styled(PrimitiveStyleBuilder::new().fill_color(ORANGE).build())
+                .draw(display)
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        }
+        let fg = if is_sel { BG } else { WHITE };
+        let line = format!("{:<18.18} c{}", c.ssid, c.channel);
+        Text::new(&line, Point::new(8, y + 5), MonoTextStyle::new(&FONT_6X10, fg))
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        y += 24;
+    }
+    Ok(())
+}

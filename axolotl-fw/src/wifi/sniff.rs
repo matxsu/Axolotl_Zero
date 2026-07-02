@@ -26,9 +26,6 @@ use embedded_graphics::{
 };
 use ::log::info;
 
-const BOX_SSID: &str = "Livebox-58B8";
-const CANAL_DEFAUT: u8 = 6;
-
 const BG: Rgb565 = Rgb565::new(1, 4, 2);
 const ORANGE: Rgb565 = Rgb565::new(31, 35, 0);
 const WHITE: Rgb565 = Rgb565::new(31, 63, 31);
@@ -129,51 +126,39 @@ where
     Ok(())
 }
 
-/// Passe en promiscuous sur le canal de la box cible et affiche l'avancement
-/// de la capture du 4-way handshake. `back` coupe la capture et rend le modem.
+/// Passe en promiscuous sur le `channel` de la cible et affiche l'avancement de
+/// la capture du 4-way handshake. `target_ssid`/`channel` viennent du picker
+/// ([`super::scan::pick`]). `back` coupe la capture et rend le modem.
+#[allow(clippy::too_many_arguments)]
 pub fn run<D>(
     modem: impl WifiModemPeripheral,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     display: &mut D,
     back: &PinDriver<'_, Input>,
+    target_ssid: &str,
+    channel: u8,
 ) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    info!("=== Sniffer 802.11 / capture handshake ===");
+    info!("=== Sniffer 802.11 / capture handshake — cible {} canal {} ===", target_ssid, channel);
+
+    // Remet les compteurs à zéro (statiques globaux réutilisés entre sessions).
+    for c in [&N_TOTAL, &N_MGMT, &N_DATA, &N_EAPOL, &MSG_SEEN] {
+        c.store(0, Ordering::Relaxed);
+    }
 
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
     wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
     wifi.start()?;
 
-    banner(display, "Capture handshake", "Recherche de la box", BOX_SSID)?;
-    let mut reseaux = wifi.scan()?;
-    let mut essais = 0;
-    while essais < 8 && !reseaux.iter().any(|ap| ap.ssid.as_str() == BOX_SSID) {
-        FreeRtos::delay_ms(400);
-        reseaux = wifi.scan()?;
-        essais += 1;
-    }
-    let mut canal = CANAL_DEFAUT;
-    let mut trouve = false;
-    for ap in reseaux.iter() {
-        info!("scan: {} canal {}", ap.ssid.as_str(), ap.channel);
-        if ap.ssid.as_str() == BOX_SSID {
-            canal = ap.channel;
-            trouve = true;
-        }
-    }
-    if trouve {
-        let l1 = format!("Box '{}' trouvee", BOX_SSID);
-        let l2 = format!("Canal : {}", canal);
-        banner(display, "Capture handshake", &l1, &l2)?;
-    } else {
-        let l2 = format!("Canal defaut : {}", canal);
-        banner(display, "Capture handshake", "Box non trouvee", &l2)?;
-    }
-    FreeRtos::delay_ms(3000);
+    let canal = channel;
+    let l1 = format!("Cible : {:.18}", target_ssid);
+    let l2 = format!("Canal : {}", canal);
+    banner(display, "Capture handshake", &l1, &l2)?;
+    FreeRtos::delay_ms(1500);
 
     unsafe {
         esp_wifi_set_promiscuous(true);
