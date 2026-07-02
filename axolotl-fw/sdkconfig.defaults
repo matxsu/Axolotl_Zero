@@ -18,11 +18,25 @@ CONFIG_FATFS_MAX_LFN=255
 # SD SPI
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 
-# Custom partition table (partitions.csv)
-CONFIG_PARTITION_TABLE_CUSTOM=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
-CONFIG_PARTITION_TABLE_OFFSET=0x8000
+# Table de partitions custom (partitions.csv) : NE PAS l'activer ici.
+# Per README esp-idf-sys, le build n'utilise pas la table custom (et n'en a pas
+# besoin) ; elle est appliquée au FLASH via espflash.toml (partition_table =
+# "partitions.csv"). Mettre CONFIG_PARTITION_TABLE_CUSTOM ici casse le build
+# (cmake cherche out/partitions.csv). Le fichier reste utilisé au flash.
 
 # FAT on internal flash (wear-levelling)
 CONFIG_WL_SECTOR_SIZE=4096
 CONFIG_FATFS_VFS_FSTAT_BLKSIZE=512
+
+# Bluetooth LE (NimBLE) — requis par esp32-nimble pour le BadUSB HID BLE.
+# Sans ça, esp-idf-sys ne génère pas les bindings ble_gatt_* → erreur de compil.
+# Bloc aligné sur l'exemple officiel esp32-nimble (mode contrôleur BLE-only inclus).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=7000
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
+CONFIG_BTDM_CTRL_MODE_BTDM=n

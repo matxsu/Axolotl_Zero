@@ -13,6 +13,12 @@ build-std = ["std", "panic_abort"]
 MCU = "esp32s3"
 ESP_IDF_VERSION = "v5.5.3"
 ESP_IDF_TOOLS_INSTALL_DIR = "workspace"
+# Workspace à 2 crates : esp-idf-sys résout sdkconfig.defaults relativement à la
+# RACINE du workspace (abspath_relative_to(workspace_dir)), pas au crate. Or le
+# fichier est dans axolotl-fw/. Sans ces 2 lignes, sdkconfig.defaults était
+# totalement ignoré → BT/NimBLE jamais activé, stack sizes/FATFS non appliqués.
+ESP_IDF_SYS_ROOT_CRATE = "axolotl-fw"
+ESP_IDF_SDKCONFIG_DEFAULTS = "axolotl-fw/sdkconfig.defaults"
 
 # Uncomment this if you have moved the target dir by setting CARGO_TARGET_DIR or similar.
 # Required for now due to embuild limitations.

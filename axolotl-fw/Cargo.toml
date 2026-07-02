@@ -22,6 +22,7 @@ embedded-graphics = "0.8"
 esp-idf-hal      = { git = "https://github.com/esp-rs/esp-idf-hal.git" }
 anyhow = "1.0.102"
 embedded-svc = "0.29"
+esp32-nimble = "0.12"
 axolotl-core = { path = "../axolotl-core" }
 
 [build-dependencies]
