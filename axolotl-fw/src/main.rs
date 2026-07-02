@@ -37,7 +37,7 @@ const GRAY: Rgb565 = Rgb565::new(9, 22, 13);
 const BLACK: Rgb565 = Rgb565::BLACK;
 const GREEN: Rgb565 = Rgb565::new(0, 40, 0);
 
-const MENU_ITEMS: [&str; 5] = ["NFC / RFID", "Sub-GHz 433", "WiFi Tools", "BadUSB", "Storage"];
+const MENU_ITEMS: [&str; 4] = ["NFC / RFID", "WiFi Tools", "BadUSB", "Storage"];
 
 /// Cache des derniers dumps en RAM — permet de re-cloner après être revenu
 /// au menu sans re-scanner la carte source. Reset à chaque reboot.
@@ -272,7 +272,7 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_dwn,
                     &btn_rht,
                 )?,
-                2 => run_wifi_menu(
+                1 => run_wifi_menu(
                     &mut display,
                     &mut modem,
                     &sysloop,
@@ -283,8 +283,8 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_dwn,
                     &btn_rht,
                 )?,
-                3 => run_badusb(&mut display, &btn_mid, &btn_lft)?,
-                4 => run_storage_browser(
+                2 => run_badusb(&mut display, &btn_mid, &btn_lft)?,
+                3 => run_storage_browser(
                     &mut display,
                     storage,
                     &btn_mid,
@@ -293,20 +293,7 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_dwn,
                     web_ip,
                 )?,
-                _ => {
-                    draw_selected(&mut display, selected)?;
-                    loop {
-                        if btn_mid.is_low()
-                            || btn_up.is_low()
-                            || btn_dwn.is_low()
-                            || btn_lft.is_low()
-                            || btn_rht.is_low()
-                        {
-                            break;
-                        }
-                        FreeRtos::delay_ms(20);
-                    }
-                }
+                _ => {}
             }
             draw_menu_full(&mut display, selected)?;
             let mut t = 0u32;
@@ -774,9 +761,15 @@ where
                         break;
                     }
                 }
-                // Reset toujours — le PN532 doit revenir en état propre pour le
-                // prochain scan.
-                pn532.reset_field();
+                // Récupération complète après CHAQUE interaction carte (et pas
+                // seulement `reset_field`) : une lecture/dump ratée (clés
+                // inconnues, carte perdue, type non supporté) renvoie Ok/Ok(None)
+                // — jamais Err — donc le handler d'erreur ci-dessous ne se
+                // déclenche pas, et un simple cycle RF ne suffit pas à resynchroniser
+                // le bus I2C. Sans ça : après un échec de lecture, plus AUCUN badge
+                // n'était détecté (read_uid renvoyait Ok(None) en boucle). Le coût
+                // (~100 ms) est payé une fois par carte, pas à chaque scan.
+                pn532.recover();
                 // LEFT ici signifiait "quitter cette carte", PAS "quitter le NFC".
                 // On consomme l'appui et on retourne au scan : poser une nouvelle
                 // carte la détecte directement. Pour sortir du NFC, ré-appuyer
@@ -2763,28 +2756,3 @@ where
     Ok(())
 }
 
-fn draw_selected<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
-where
-    D: DrawTarget<Color = Rgb565>,
-    D::Error: core::fmt::Debug,
-{
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
-    Text::with_text_style(
-        MENU_ITEMS[selected],
-        Point::new(120, 100),
-        MonoTextStyle::new(&FONT_10X20, ORANGE),
-        centered,
-    )
-    .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::with_text_style(
-        "[ appuie pour revenir ]",
-        Point::new(120, 140),
-        MonoTextStyle::new(&FONT_6X10, WHITE),
-        centered,
-    )
-    .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Ok(())
-}
