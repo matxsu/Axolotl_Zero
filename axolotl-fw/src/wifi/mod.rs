@@ -16,6 +16,7 @@
 
 pub mod captive_dns;
 pub mod eviltwin;
+pub mod portals;
 pub mod scan;
 pub mod sniff;
 
