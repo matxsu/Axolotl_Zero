@@ -50,9 +50,6 @@ struct LastDumps {
     ultralight: Option<Vec<u8>>,
 }
 
-fn item_y(i: usize) -> i32 {
-    45 + (i as i32 * 36)
-}
 
 fn main() -> anyhow::Result<()> {
     link_patches();
@@ -196,39 +193,29 @@ fn run_app() -> anyhow::Result<()> {
     // ── Menu ──────────────────────────────────────────────────────────────
     let mut selected: usize = 0;
     let mut last_dumps = LastDumps::default();
-    draw_menu_full(&mut display, selected)?;
+    draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
 
     // Front descendant pour MID : ne déclenche que sur transition HIGH→LOW.
     let mut mid_prev_low = btn_mid.is_low();
     loop {
         if btn_up.is_low() {
-            let prev = selected;
-            selected = if selected == 0 {
-                MENU_ITEMS.len() - 1
-            } else {
-                selected - 1
-            };
-            draw_menu_item(&mut display, prev, false)?;
-            draw_menu_item(&mut display, selected, true)?;
+            selected = if selected == 0 { MENU_ITEMS.len() - 1 } else { selected - 1 };
+            draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
             while btn_up.is_low() {
                 FreeRtos::delay_ms(10);
             }
         }
         if btn_dwn.is_low() {
-            let prev = selected;
             selected = (selected + 1) % MENU_ITEMS.len();
-            draw_menu_item(&mut display, prev, false)?;
-            draw_menu_item(&mut display, selected, true)?;
+            draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
             while btn_dwn.is_low() {
                 FreeRtos::delay_ms(10);
             }
         }
         if btn_lft.is_low() {
             if selected != 0 {
-                let prev = selected;
                 selected = 0;
-                draw_menu_item(&mut display, prev, false)?;
-                draw_menu_item(&mut display, selected, true)?;
+                draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
             }
             while btn_lft.is_low() {
                 FreeRtos::delay_ms(10);
@@ -236,10 +223,8 @@ fn run_app() -> anyhow::Result<()> {
         }
         if btn_rht.is_low() {
             if selected != MENU_ITEMS.len() - 1 {
-                let prev = selected;
                 selected = MENU_ITEMS.len() - 1;
-                draw_menu_item(&mut display, prev, false)?;
-                draw_menu_item(&mut display, selected, true)?;
+                draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
             }
             while btn_rht.is_low() {
                 FreeRtos::delay_ms(10);
@@ -295,7 +280,7 @@ fn run_app() -> anyhow::Result<()> {
                 )?,
                 _ => {}
             }
-            draw_menu_full(&mut display, selected)?;
+            draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
             let mut t = 0u32;
             while (btn_mid.is_low() || btn_up.is_low() || btn_dwn.is_low()) && t < 100 {
                 FreeRtos::delay_ms(10);
@@ -562,7 +547,11 @@ where
     Ok(())
 }
 
-/// Dessine un sous-menu générique (même style que [`draw_attack_menu`]).
+/// Menu générique **scrollable** : barre de titre (avec compteur `sel/total`),
+/// fenêtre glissante de [`MENU_VISIBLE`] items, flèches ^/v si débordement.
+/// Utilisé par le menu principal ET les sous-menus (WiFi, etc.).
+const MENU_VISIBLE: usize = 5;
+
 fn draw_submenu<D>(display: &mut D, title: &str, items: &[&str], selected: usize) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -577,14 +566,39 @@ where
     Text::with_text_style(title, Point::new(120, 22), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
         .draw(display)
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    for (i, label) in items.iter().enumerate() {
-        let y = 40 + i as i32 * 38;
+    // Compteur position (ex. 2/6) à droite si ça déborde.
+    if items.len() > MENU_VISIBLE {
+        let counter = format!("{}/{}", selected + 1, items.len());
+        Text::new(&counter, Point::new(196, 20), MonoTextStyle::new(&FONT_6X10, WHITE))
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+
+    // Fenêtre glissante centrée autour de la sélection.
+    let start = if items.len() <= MENU_VISIBLE {
+        0
+    } else {
+        selected.saturating_sub(MENU_VISIBLE / 2).min(items.len() - MENU_VISIBLE)
+    };
+    for (row, i) in (start..items.len()).take(MENU_VISIBLE).enumerate() {
+        let y = 40 + row as i32 * 38;
         let (bg, fg) = if i == selected { (ORANGE, BLACK) } else { (BG, WHITE) };
         Rectangle::new(Point::new(10, y), Size::new(220, 30))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
             .draw(display)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Text::new(label, Point::new(20, y + 21), MonoTextStyle::new(&FONT_10X20, fg))
+        Text::new(items[i], Point::new(20, y + 21), MonoTextStyle::new(&FONT_10X20, fg))
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    // Flèches de défilement.
+    if start > 0 {
+        Text::new("^", Point::new(224, 44), MonoTextStyle::new(&FONT_6X10, ORANGE))
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    if start + MENU_VISIBLE < items.len() {
+        Text::new("v", Point::new(224, 230), MonoTextStyle::new(&FONT_6X10, ORANGE))
             .draw(display)
             .map_err(|e| anyhow::anyhow!("{:?}", e))?;
     }
@@ -2706,53 +2720,4 @@ where
     Ok(())
 }
 
-fn draw_menu_full<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
-where
-    D: DrawTarget<Color = Rgb565>,
-    D::Error: core::fmt::Debug,
-{
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
-        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
-    Text::with_text_style(
-        "AXOLOTL ZERO",
-        Point::new(120, 22),
-        MonoTextStyle::new(&FONT_10X20, ORANGE),
-        centered,
-    )
-    .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    for i in 0..MENU_ITEMS.len() {
-        draw_menu_item(display, i, i == selected)?;
-    }
-    Ok(())
-}
-
-fn draw_menu_item<D>(display: &mut D, i: usize, selected: bool) -> anyhow::Result<()>
-where
-    D: DrawTarget<Color = Rgb565>,
-    D::Error: core::fmt::Debug,
-{
-    let y = item_y(i);
-    let (bg_color, txt_color) = if selected {
-        (ORANGE, BLACK)
-    } else {
-        (BG, WHITE)
-    };
-    Rectangle::new(Point::new(10, y), Size::new(220, 28))
-        .into_styled(PrimitiveStyleBuilder::new().fill_color(bg_color).build())
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::new(
-        MENU_ITEMS[i],
-        Point::new(20, y + 20),
-        MonoTextStyle::new(&FONT_10X20, txt_color),
-    )
-    .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Ok(())
-}
 
