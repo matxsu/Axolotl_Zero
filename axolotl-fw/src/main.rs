@@ -24,6 +24,7 @@ use esp_idf_svc::{eventloop::EspSystemEventLoop, nvs::EspDefaultNvsPartition, sy
 use mipidsi::{models::ST7789, Builder};
 use storage::SdWrite;
 
+mod badusb;
 mod logo;
 mod nfc;
 mod storage;
@@ -36,7 +37,7 @@ const GRAY: Rgb565 = Rgb565::new(9, 22, 13);
 const BLACK: Rgb565 = Rgb565::BLACK;
 const GREEN: Rgb565 = Rgb565::new(0, 40, 0);
 
-const MENU_ITEMS: [&str; 4] = ["NFC / RFID", "Sub-GHz 433", "WiFi Tools", "Storage"];
+const MENU_ITEMS: [&str; 5] = ["NFC / RFID", "Sub-GHz 433", "WiFi Tools", "BadUSB", "Storage"];
 
 /// Cache des derniers dumps en RAM — permet de re-cloner après être revenu
 /// au menu sans re-scanner la carte source. Reset à chaque reboot.
@@ -155,20 +156,15 @@ fn run_app() -> anyhow::Result<()> {
     )?;
     let mut pn532 = nfc::Pn532::new(i2c)?;
 
-    // ── WiFi AP + serveur HTTP (non-fatal : SD browser web) ──────────────────
+    // ── WiFi / BadUSB : radio à la demande ───────────────────────────────────
+    // Le modem n'est plus consommé au boot : il est emprunté par chaque outil
+    // WiFi (scan / sniff / evil-twin / file browser), et libéré pour laisser le
+    // BLE (BadUSB) prendre le contrôleur radio.
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
-    let web_server = wifi::WebServer::start(peripherals.modem, sysloop, nvs)
-        .map_err(|e| {
-            log::warn!("WebServer: {:?} — mode sans wifi", e);
-            e
-        })
-        .ok();
-    let web_ip: Option<&str> = if web_server.is_some() {
-        Some(wifi::AP_IP)
-    } else {
-        None
-    };
+    let mut modem = peripherals.modem;
+    // Le file browser n'étant plus lancé au boot, aucune IP AP permanente.
+    let web_ip: Option<&str> = None;
 
     // ── Joystick ──────────────────────────────────────────────────────────
     let btn_up = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;
@@ -276,7 +272,19 @@ fn run_app() -> anyhow::Result<()> {
                     &btn_dwn,
                     &btn_rht,
                 )?,
-                3 => run_storage_browser(
+                2 => run_wifi_menu(
+                    &mut display,
+                    &mut modem,
+                    &sysloop,
+                    &nvs,
+                    &btn_mid,
+                    &btn_lft,
+                    &btn_up,
+                    &btn_dwn,
+                    &btn_rht,
+                )?,
+                3 => run_badusb(&mut display, &btn_mid, &btn_lft)?,
+                4 => run_storage_browser(
                     &mut display,
                     storage,
                     &btn_mid,
@@ -312,6 +320,186 @@ fn run_app() -> anyhow::Result<()> {
 }
 
 // ── NFC scan ───────────────────────────────────────────────────────────────
+
+// ── Sous-menu WiFi Tools ───────────────────────────────────────────────────
+
+const WIFI_ITEMS: &[&str; 5] = &["File browser", "Scan reseaux", "Sniff / Deauth", "Evil twin", "Retour"];
+
+/// Sous-menu WiFi : chaque outil emprunte le modem (`split_reborrow`) le temps
+/// de son écran puis le rend au retour — aucun outil ne tourne en fond, ce qui
+/// libère la radio pour le suivant (ou pour le BLE du BadUSB).
+#[allow(clippy::too_many_arguments)]
+fn run_wifi_menu<D>(
+    display: &mut D,
+    modem: &mut esp_idf_hal::modem::Modem<'static>,
+    sysloop: &EspSystemEventLoop,
+    nvs: &EspDefaultNvsPartition,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    _btn_rht: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let mut sel = 0usize;
+    draw_submenu(display, "WIFI TOOLS", WIFI_ITEMS, sel)?;
+    let mut mid_prev = btn_mid.is_low();
+    loop {
+        if btn_up.is_low() {
+            sel = if sel == 0 { WIFI_ITEMS.len() - 1 } else { sel - 1 };
+            draw_submenu(display, "WIFI TOOLS", WIFI_ITEMS, sel)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            sel = (sel + 1) % WIFI_ITEMS.len();
+            draw_submenu(display, "WIFI TOOLS", WIFI_ITEMS, sel)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_lft.is_low() {
+            // Gauche = retour direct au menu principal.
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(());
+        }
+        let cur = btn_mid.is_low();
+        let edge = cur && !mid_prev;
+        mid_prev = cur;
+        if edge {
+            let mut t = 0u32;
+            while btn_mid.is_low() && t < 50 {
+                FreeRtos::delay_ms(10);
+                t += 1;
+            }
+            match sel {
+                0 => {
+                    // File browser : AP + HTTP tant qu'on ne fait pas "retour".
+                    let (wm, _bt) = modem.split_reborrow();
+                    match wifi::WebServer::start(wm, sysloop.clone(), nvs.clone()) {
+                        Ok(_srv) => {
+                            draw_wifi_info(display, "FILE BROWSER", wifi::AP_SSID, wifi::AP_IP)?;
+                            while !btn_lft.is_low() {
+                                FreeRtos::delay_ms(50);
+                            }
+                            // _srv drop ici → modem rendu.
+                        }
+                        Err(e) => {
+                            log::warn!("WebServer: {:?}", e);
+                            draw_wifi_info(display, "FILE BROWSER", "Erreur AP", "voir logs")?;
+                            FreeRtos::delay_ms(1500);
+                        }
+                    }
+                }
+                1 => {
+                    let (wm, _bt) = modem.split_reborrow();
+                    wifi::scan::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)?;
+                }
+                2 => {
+                    let (wm, _bt) = modem.split_reborrow();
+                    wifi::sniff::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)?;
+                }
+                3 => {
+                    let (wm, _bt) = modem.split_reborrow();
+                    wifi::eviltwin::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)?;
+                }
+                _ => return Ok(()), // Retour
+            }
+            // Absorbe le relâchement du bouton retour puis redessine le sous-menu.
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            draw_submenu(display, "WIFI TOOLS", WIFI_ITEMS, sel)?;
+        }
+        FreeRtos::delay_ms(20);
+    }
+}
+
+/// Écran BadUSB : clavier HID BLE. Attend l'appairage puis joue le payload.
+fn run_badusb<D>(
+    display: &mut D,
+    btn_mid: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    draw_wifi_info(display, "BADUSB BLE", "Appairez :", "Axolotl Keyboard")?;
+    match badusb::make_keyboard() {
+        Ok(kb) => badusb::run_payload(kb, btn_lft),
+        Err(e) => {
+            log::warn!("BadUSB: init BLE KO: {:?}", e);
+            draw_wifi_info(display, "BADUSB BLE", "Erreur init BLE", "voir logs")?;
+            while !btn_lft.is_low() && !btn_mid.is_low() {
+                FreeRtos::delay_ms(50);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dessine un sous-menu générique (même style que [`draw_attack_menu`]).
+fn draw_submenu<D>(display: &mut D, title: &str, items: &[&str], selected: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(title, Point::new(120, 22), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    for (i, label) in items.iter().enumerate() {
+        let y = 40 + i as i32 * 38;
+        let (bg, fg) = if i == selected { (ORANGE, BLACK) } else { (BG, WHITE) };
+        Rectangle::new(Point::new(10, y), Size::new(220, 30))
+            .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(label, Point::new(20, y + 21), MonoTextStyle::new(&FONT_10X20, fg))
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    }
+    Ok(())
+}
+
+/// Écran d'info à 2 lignes (titre + 2 lignes), pour file browser / BadUSB.
+fn draw_wifi_info<D>(display: &mut D, title: &str, l1: &str, l2: &str) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(title, Point::new(120, 22), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(l1, Point::new(120, 110), MonoTextStyle::new(&FONT_10X20, WHITE), centered)
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style(l2, Point::new(120, 140), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::with_text_style("< retour", Point::new(120, 220), MonoTextStyle::new(&FONT_10X20, GRAY), centered)
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Ok(())
+}
 
 fn run_nfc_scan<D>(
     display: &mut D,
