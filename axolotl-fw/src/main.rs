@@ -848,15 +848,13 @@ where
                         break;
                     }
                 }
-                // Récupération complète après CHAQUE interaction carte (et pas
-                // seulement `reset_field`) : une lecture/dump ratée (clés
-                // inconnues, carte perdue, type non supporté) renvoie Ok/Ok(None)
-                // — jamais Err — donc le handler d'erreur ci-dessous ne se
-                // déclenche pas, et un simple cycle RF ne suffit pas à resynchroniser
-                // le bus I2C. Sans ça : après un échec de lecture, plus AUCUN badge
-                // n'était détecté (read_uid renvoyait Ok(None) en boucle). Le coût
-                // (~100 ms) est payé une fois par carte, pas à chaque scan.
-                pn532.recover();
+                // Reset toujours — le PN532 doit revenir en état propre pour le
+                // prochain scan. (recover() a été essayé ici mais casse la
+                // détection normale : le drain I2C agressif + les commandes
+                // supplémentaires décalent les reads suivants → plus aucun badge
+                // détecté. reset_field() est la séquence prouvée fiable ; la
+                // récupération lourde reste réservée au handler d'erreur de comm.)
+                pn532.reset_field();
                 // LEFT ici signifiait "quitter cette carte", PAS "quitter le NFC".
                 // On consomme l'appui et on retourne au scan : poser une nouvelle
                 // carte la détecte directement. Pour sortir du NFC, ré-appuyer
