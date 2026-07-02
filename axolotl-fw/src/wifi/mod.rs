@@ -8,6 +8,16 @@
 //!   GET  /api/files?dir=dumps|dicts → [{n:"nom",s:taille},...]
 //!   GET  /file?path=... → téléchargement fichier
 //!   POST /file?path=... → upload fichier
+//!
+//! Sous-modules d'attaque (portés depuis `feature/wifi_attacks`) :
+//!   - [`scan`]     : scan des réseaux 2.4 GHz
+//!   - [`sniff`]    : capture / deauth
+//!   - [`captive_dns`] + [`eviltwin`] : AP evil-twin + portail captif
+
+pub mod captive_dns;
+pub mod eviltwin;
+pub mod scan;
+pub mod sniff;
 
 use embedded_svc::http::Method;
 use esp_idf_svc::{
@@ -26,14 +36,17 @@ const SD_DICTS: &str = "/sdcard/NFC/dicts";
 
 static INDEX_HTML: &[u8] = include_bytes!("index.html");
 
-pub struct WebServer {
-    _wifi: BlockingWifi<EspWifi<'static>>,
-    _http: EspHttpServer<'static>,
+pub struct WebServer<'d> {
+    _wifi: BlockingWifi<EspWifi<'d>>,
+    _http: EspHttpServer<'d>,
 }
 
-impl WebServer {
+impl<'d> WebServer<'d> {
+    /// Démarre l'AP + serveur HTTP. `modem` est **emprunté** (`impl Peripheral`)
+    /// pour être relâché à la destruction de `WebServer` — permet un usage à la
+    /// demande depuis le menu (le modem repart aux autres outils Wi-Fi).
     pub fn start(
-        modem: esp_idf_hal::modem::Modem<'static>,
+        modem: impl esp_idf_svc::hal::modem::WifiModemPeripheral + 'd,
         sysloop: EspSystemEventLoop,
         nvs: EspDefaultNvsPartition,
     ) -> anyhow::Result<Self> {
