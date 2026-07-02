@@ -323,7 +323,8 @@ fn run_app() -> anyhow::Result<()> {
 
 // ── Sous-menu WiFi Tools ───────────────────────────────────────────────────
 
-const WIFI_ITEMS: &[&str; 5] = &["File browser", "Scan reseaux", "Sniff / Deauth", "Evil twin", "Retour"];
+const WIFI_ITEMS: &[&str; 6] =
+    &["Scan reseaux", "Evil twin", "Sniff / Deauth", "File browser", "Creds captures", "Retour"];
 
 /// Sous-menu WiFi : chaque outil emprunte le modem (`split_reborrow`) le temps
 /// de son écran puis le rend au retour — aucun outil ne tourne en fond, ce qui
@@ -380,6 +381,55 @@ where
             }
             match sel {
                 0 => {
+                    // Scan (affichage en boucle).
+                    let (wm, _bt) = modem.split_reborrow();
+                    if let Err(e) = wifi::scan::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft) {
+                        wifi_tool_error(display, "SCAN", &e)?;
+                    }
+                }
+                1 => {
+                    // Evil twin : choisir un réseau à cloner, puis un portail SD.
+                    // Le 1er reborrow est scopé pour libérer le modem avant le 2e.
+                    let picked = {
+                        let (wm, _bt) = modem.split_reborrow();
+                        wifi::scan::pick(wm, sysloop.clone(), nvs.clone(), display, btn_up, btn_dwn, btn_mid, btn_lft)
+                    };
+                    match picked {
+                        Ok(Some(choice)) => {
+                            if let Some(site) = wifi::portals::pick(display, btn_up, btn_dwn, btn_mid, btn_lft)? {
+                                let path = wifi::portals::html_path(&site);
+                                let (wm2, _bt2) = modem.split_reborrow();
+                                if let Err(e) = wifi::eviltwin::run(
+                                    wm2, sysloop.clone(), nvs.clone(), display, btn_lft, &choice.ssid, &path,
+                                ) {
+                                    wifi_tool_error(display, "EVIL TWIN", &e)?;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => wifi_tool_error(display, "SCAN", &e)?,
+                    }
+                }
+                2 => {
+                    // Sniff : choisir un réseau, capturer sur son canal.
+                    let picked = {
+                        let (wm, _bt) = modem.split_reborrow();
+                        wifi::scan::pick(wm, sysloop.clone(), nvs.clone(), display, btn_up, btn_dwn, btn_mid, btn_lft)
+                    };
+                    match picked {
+                        Ok(Some(choice)) => {
+                            let (wm2, _bt2) = modem.split_reborrow();
+                            if let Err(e) = wifi::sniff::run(
+                                wm2, sysloop.clone(), nvs.clone(), display, btn_lft, &choice.ssid, choice.channel,
+                            ) {
+                                wifi_tool_error(display, "SNIFF", &e)?;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => wifi_tool_error(display, "SCAN", &e)?,
+                    }
+                }
+                3 => {
                     // File browser : AP + HTTP tant qu'on ne fait pas "retour".
                     let (wm, _bt) = modem.split_reborrow();
                     match wifi::WebServer::start(wm, sysloop.clone(), nvs.clone()) {
@@ -390,25 +440,10 @@ where
                             }
                             // _srv drop ici → modem rendu.
                         }
-                        Err(e) => {
-                            log::warn!("WebServer: {:?}", e);
-                            draw_wifi_info(display, "FILE BROWSER", "Erreur AP", "voir logs")?;
-                            FreeRtos::delay_ms(1500);
-                        }
+                        Err(e) => wifi_tool_error(display, "FILE BROWSER", &e)?,
                     }
                 }
-                1 => {
-                    let (wm, _bt) = modem.split_reborrow();
-                    wifi::scan::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)?;
-                }
-                2 => {
-                    let (wm, _bt) = modem.split_reborrow();
-                    wifi::sniff::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)?;
-                }
-                3 => {
-                    let (wm, _bt) = modem.split_reborrow();
-                    wifi::eviltwin::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)?;
-                }
+                4 => run_creds_viewer(display, btn_up, btn_dwn, btn_lft)?,
                 _ => return Ok(()), // Retour
             }
             // Absorbe le relâchement du bouton retour puis redessine le sous-menu.
@@ -419,6 +454,101 @@ where
         }
         FreeRtos::delay_ms(20);
     }
+}
+
+/// Garde-fou : affiche un écran d'erreur (au lieu de propager/planter) quand un
+/// outil WiFi échoue — typiquement `ESP_ERR_NO_MEM`. Détail dans les logs.
+fn wifi_tool_error<D>(display: &mut D, title: &str, e: &anyhow::Error) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    log::warn!("{}: {:?}", title, e);
+    draw_wifi_info(display, title, "Erreur", "voir logs")?;
+    FreeRtos::delay_ms(1800);
+    Ok(())
+}
+
+/// Écran de consultation des credentials capturés (`/sdcard/loot/creds.csv`).
+/// UP/DOWN défilent, gauche = retour.
+fn run_creds_viewer<D>(
+    display: &mut D,
+    btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_dwn: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+    btn_lft: &PinDriver<'_, esp_idf_hal::gpio::Input>,
+) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    let content = std::fs::read_to_string("/sdcard/loot/creds.csv").unwrap_or_default();
+    let lines: Vec<String> = content.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        draw_wifi_info(display, "CREDS", "Aucun credential", "capture pour l'instant")?;
+        while !btn_lft.is_low() {
+            FreeRtos::delay_ms(50);
+        }
+        while btn_lft.is_low() {
+            FreeRtos::delay_ms(10);
+        }
+        return Ok(());
+    }
+
+    let mut top = 0usize;
+    draw_creds(display, &lines, top)?;
+    loop {
+        if btn_up.is_low() {
+            top = top.saturating_sub(1);
+            draw_creds(display, &lines, top)?;
+            while btn_up.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_dwn.is_low() {
+            if top + 1 < lines.len() {
+                top += 1;
+            }
+            draw_creds(display, &lines, top)?;
+            while btn_dwn.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+        }
+        if btn_lft.is_low() {
+            while btn_lft.is_low() {
+                FreeRtos::delay_ms(10);
+            }
+            return Ok(());
+        }
+        FreeRtos::delay_ms(20);
+    }
+}
+
+/// Affiche les creds à partir de l'index `top` (une ligne CSV par row).
+fn draw_creds<D>(display: &mut D, lines: &[String], top: usize) -> anyhow::Result<()>
+where
+    D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
+{
+    const VISIBLE: usize = 9;
+    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Rectangle::new(Point::new(0, 0), Size::new(240, 30))
+        .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let title = format!("CREDS  {}/{}", (top + 1).min(lines.len()), lines.len());
+    Text::new(&title, Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
+        .draw(display)
+        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    let mut y = 44i32;
+    for line in lines.iter().skip(top).take(VISIBLE) {
+        // Découpe par caractères (pas d'index d'octet → pas de panic UTF-8).
+        let shown: String = line.chars().take(39).collect();
+        Text::new(&shown, Point::new(6, y), MonoTextStyle::new(&FONT_6X10, WHITE))
+            .draw(display)
+            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        y += 20;
+    }
+    Ok(())
 }
 
 /// Écran BadUSB : clavier HID BLE. Attend l'appairage puis joue le payload.
