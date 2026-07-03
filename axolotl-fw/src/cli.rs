@@ -5,10 +5,10 @@
 //! **qu'à la SD (VFS, thread-safe) et aux infos système** — jamais au PN532 ni
 //! au modem (ceux-ci appartiennent au thread menu → pas de contention).
 //!
-//! Sortie via `println!`/`print!` : c'est de l'I/O console (réponses au user),
-//! pas du logging — l'interdiction `println!` du projet vise les logs, pas un
-//! REPL. Se branche sur `cargo espflash monitor` (les touches tapées y sont
-//! renvoyées vers l'UART RX de l'ESP32).
+//! IMPORTANT : la sortie passe par `log::info!` (logger esp-idf, thread-safe),
+//! PAS par `println!` — sur esp-idf, `println!` depuis un thread panique
+//! (`failed printing to stdout`) et fait rebooter en boucle. Se branche sur
+//! `cargo espflash monitor` (les touches y sont renvoyées vers l'UART RX).
 
 use esp_idf_svc::hal::delay::FreeRtos;
 use std::io::Read;
@@ -22,7 +22,7 @@ pub fn spawn() {
 }
 
 fn cli_loop() {
-    println!("\n[axolotl-cli] prêt — tape 'help'.");
+    ::log::info!("[cli] prêt — tape 'help' dans le moniteur série");
     let mut line = String::new();
     loop {
         let mut b = [0u8; 1];
@@ -33,8 +33,6 @@ fn cli_loop() {
                     let cmd = line.trim().to_string();
                     if !cmd.is_empty() {
                         exec(&cmd);
-                        print!("axolotl> ");
-                        let _ = std::io::Write::flush(&mut std::io::stdout());
                     }
                     line.clear();
                 } else if line.len() < 512 {
@@ -59,31 +57,31 @@ fn exec(line: &str) {
         "creds" => cat("/sdcard/loot/creds.csv"),
         "rm" => rm(arg),
         "mkdir" => mkdir(arg),
-        _ => println!("commande inconnue: '{cmd}' (tape 'help')"),
+        _ => ::log::info!("commande inconnue: '{cmd}' (tape 'help')"),
     }
 }
 
 fn help() {
-    println!("Commandes Axolotl CLI :");
-    println!("  help | ?           cette aide");
-    println!("  status | df        heap libre, uptime, SD, version");
-    println!("  ls [chemin]        liste un dossier (défaut /sdcard)");
-    println!("  tree [chemin]      arborescence récursive (profondeur 3)");
-    println!("  cat <chemin>       affiche un fichier (texte)");
-    println!("  creds              affiche /sdcard/loot/creds.csv");
-    println!("  rm <chemin>        supprime un fichier");
-    println!("  mkdir <chemin>     crée un dossier");
+    ::log::info!("Commandes Axolotl CLI :");
+    ::log::info!("  help | ?           cette aide");
+    ::log::info!("  status | df        heap libre, uptime, SD, version");
+    ::log::info!("  ls [chemin]        liste un dossier (défaut /sdcard)");
+    ::log::info!("  tree [chemin]      arborescence récursive (profondeur 3)");
+    ::log::info!("  cat <chemin>       affiche un fichier (texte)");
+    ::log::info!("  creds              affiche /sdcard/loot/creds.csv");
+    ::log::info!("  rm <chemin>        supprime un fichier");
+    ::log::info!("  mkdir <chemin>     crée un dossier");
 }
 
 fn status() {
     let heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
     let min = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
     let up = unsafe { esp_idf_svc::sys::esp_timer_get_time() } / 1_000_000;
-    println!("heap libre : {heap} o  (min jamais atteint : {min} o)");
-    println!("uptime     : {up} s");
-    println!("SD montée  : {}", std::fs::metadata("/sdcard").is_ok());
-    println!("spiflash   : {}", std::fs::metadata("/spiflash").is_ok());
-    println!("version    : {}", env!("CARGO_PKG_VERSION"));
+    ::log::info!("heap libre : {heap} o  (min jamais atteint : {min} o)");
+    ::log::info!("uptime     : {up} s");
+    ::log::info!("SD montée  : {}", std::fs::metadata("/sdcard").is_ok());
+    ::log::info!("spiflash   : {}", std::fs::metadata("/spiflash").is_ok());
+    ::log::info!("version    : {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn ls(path: &str) {
@@ -94,16 +92,16 @@ fn ls(path: &str) {
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 let name = e.file_name().to_string_lossy().into_owned();
                 if is_dir {
-                    println!("  <dir>     {name}");
+                    ::log::info!("  <dir>     {name}");
                 } else {
                     let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    println!("  {sz:>8}  {name}");
+                    ::log::info!("  {sz:>8}  {name}");
                 }
                 n += 1;
             }
-            println!("({n} entrée(s) dans {path})");
+            ::log::info!("({n} entrée(s) dans {path})");
         }
-        Err(e) => println!("ls: {path}: {e}"),
+        Err(e) => ::log::info!("ls: {path}: {e}"),
     }
 }
 
@@ -113,7 +111,7 @@ fn tree(path: &str, depth: usize) {
     }
     let Ok(rd) = std::fs::read_dir(path) else {
         if depth == 0 {
-            println!("tree: {path}: introuvable");
+            ::log::info!("tree: {path}: introuvable");
         }
         return;
     };
@@ -122,48 +120,51 @@ fn tree(path: &str, depth: usize) {
         let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
         let indent = "  ".repeat(depth);
         if is_dir {
-            println!("{indent}{name}/");
+            ::log::info!("{indent}{name}/");
             tree(&format!("{path}/{name}"), depth + 1);
         } else {
             let sz = e.metadata().map(|m| m.len()).unwrap_or(0);
-            println!("{indent}{name} ({sz} o)");
+            ::log::info!("{indent}{name} ({sz} o)");
         }
     }
 }
 
 fn cat(path: &str) {
     if path.is_empty() {
-        println!("usage: cat <chemin>");
+        ::log::info!("usage: cat <chemin>");
         return;
     }
     match std::fs::read(path) {
         Ok(data) => {
-            println!("--- {path} ({} o) ---", data.len());
-            print!("{}", String::from_utf8_lossy(&data));
-            println!("\n--- fin ---");
+            ::log::info!("--- {path} ({} o) ---", data.len());
+            // Ligne par ligne pour rester lisible dans le moniteur.
+            for l in String::from_utf8_lossy(&data).lines() {
+                ::log::info!("{l}");
+            }
+            ::log::info!("--- fin ---");
         }
-        Err(e) => println!("cat: {path}: {e}"),
+        Err(e) => ::log::info!("cat: {path}: {e}"),
     }
 }
 
 fn rm(path: &str) {
     if path.is_empty() {
-        println!("usage: rm <chemin>");
+        ::log::info!("usage: rm <chemin>");
         return;
     }
     match std::fs::remove_file(path) {
-        Ok(_) => println!("supprimé: {path}"),
-        Err(e) => println!("rm: {path}: {e}"),
+        Ok(_) => ::log::info!("supprimé: {path}"),
+        Err(e) => ::log::info!("rm: {path}: {e}"),
     }
 }
 
 fn mkdir(path: &str) {
     if path.is_empty() {
-        println!("usage: mkdir <chemin>");
+        ::log::info!("usage: mkdir <chemin>");
         return;
     }
     match std::fs::create_dir_all(path) {
-        Ok(_) => println!("créé: {path}"),
-        Err(e) => println!("mkdir: {path}: {e}"),
+        Ok(_) => ::log::info!("créé: {path}"),
+        Err(e) => ::log::info!("mkdir: {path}: {e}"),
     }
 }
