@@ -32,9 +32,6 @@ pub const AP_SSID: &str = "AxolotlZero";
 pub const AP_PASS: &str = "axolotl1";
 pub const AP_IP: &str = "192.168.71.1";
 
-const SD_DUMPS: &str = "/sdcard/NFC/dumps";
-const SD_DICTS: &str = "/sdcard/NFC/dicts";
-
 static INDEX_HTML: &[u8] = include_bytes!("index.html");
 
 pub struct WebServer<'d> {
@@ -105,19 +102,26 @@ impl<'d> WebServer<'d> {
             Ok::<(), anyhow::Error>(())
         })?;
 
-        // GET /api/files?dir=dumps|dicts
+        // GET /api/files?path=<dossier> → liste n'importe quel dossier (défaut /sdcard)
         http.fn_handler("/api/files", Method::Get, |req| {
-            let uri = req.uri().to_string();
-            let dir = if uri.contains("dicts") {
-                SD_DICTS
-            } else {
-                SD_DUMPS
-            };
-            // Crée le répertoire s'il n'existe pas (premier accès)
-            let _ = std::fs::create_dir_all(dir);
-            let json = list_dir_json(dir);
+            let mut dir = url_param(req.uri(), "path");
+            if dir.is_empty() {
+                dir = "/sdcard".to_string();
+            }
+            let json = list_dir_json(&dir);
             req.into_response(200, Some("OK"), &[("Content-Type", "application/json")])?
                 .write(json.as_bytes())
+                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Ok::<(), anyhow::Error>(())
+        })?;
+
+        // GET /api/rm?path=... → supprime un fichier
+        http.fn_handler("/api/rm", Method::Get, |req| {
+            let path = url_param(req.uri(), "path");
+            let ok = !path.is_empty() && std::fs::remove_file(&path).is_ok();
+            let body: &[u8] = if ok { b"{\"ok\":true}" } else { b"{\"ok\":false}" };
+            req.into_response(200, Some("OK"), &[("Content-Type", "application/json")])?
+                .write(body)
                 .map_err(|e| anyhow::anyhow!("{:?}", e))?;
             Ok::<(), anyhow::Error>(())
         })?;
@@ -190,21 +194,26 @@ impl<'d> WebServer<'d> {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/// Liste un répertoire en JSON : [{n:"nom",s:taille_bytes},...]
+/// Liste un répertoire en JSON : [{n:"nom",s:taille,d:true/false},...]
+/// `d`=true pour un dossier. Trié (dossiers puis fichiers via préfixe de tri).
 fn list_dir_json(path: &str) -> String {
     let Ok(rd) = std::fs::read_dir(path) else {
         return "[]".to_string();
     };
-    let mut items: Vec<String> = rd
+    let mut items: Vec<(String, String)> = rd
         .flatten()
         .map(|e| {
             let name = e.file_name().to_string_lossy().replace('"', "\\\"");
+            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-            format!("{{\"n\":\"{name}\",\"s\":{size}}}")
+            // clé de tri : dossiers d'abord (0), puis fichiers (1), par nom.
+            let key = format!("{}{}", if is_dir { '0' } else { '1' }, name);
+            (key, format!("{{\"n\":\"{name}\",\"s\":{size},\"d\":{is_dir}}}"))
         })
         .collect();
-    items.sort();
-    format!("[{}]", items.join(","))
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let json: Vec<String> = items.into_iter().map(|(_, v)| v).collect();
+    format!("[{}]", json.join(","))
 }
 
 /// Extrait un paramètre de query-string depuis une URI.
