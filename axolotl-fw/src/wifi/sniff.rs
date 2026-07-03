@@ -9,6 +9,7 @@
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;
@@ -37,6 +38,11 @@ static N_MGMT: AtomicU32 = AtomicU32::new(0);
 static N_DATA: AtomicU32 = AtomicU32::new(0);
 static N_EAPOL: AtomicU32 = AtomicU32::new(0);
 static MSG_SEEN: AtomicU32 = AtomicU32::new(0);
+
+/// Trames 802.11 brutes des EAPOL capturés (pour export .pcap sur SD). Rempli
+/// par le callback rx, vidé/écrit par `run` à la sortie. Borné pour la RAM.
+static CAPTURED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+const MAX_CAPTURED: usize = 200;
 
 unsafe extern "C" fn rx_cb(buf: *mut c_void, pkt_type: u32) {
     N_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -93,6 +99,16 @@ unsafe extern "C" fn rx_cb(buf: *mut c_void, pkt_type: u32) {
                 MSG_SEEN.fetch_or(bit, Ordering::Relaxed);
                 info!("EAPOL M{} ki={:04X}", label, ki);
             }
+            // Capture la trame 802.11 brute pour l'export .pcap (bornée).
+            if let Ok(mut g) = CAPTURED.lock() {
+                if g.len() < MAX_CAPTURED {
+                    let mut frame = Vec::with_capacity(len);
+                    for k in 0..len {
+                        frame.push(*payload.add(k));
+                    }
+                    g.push(frame);
+                }
+            }
             let mut s = String::with_capacity(len * 2);
             for k in 0..len {
                 s.push_str(&format!("{:02X}", *payload.add(k)));
@@ -126,6 +142,49 @@ where
     Ok(())
 }
 
+/// Vide [`CAPTURED`] et écrit les trames EAPOL dans un `.pcap` (DLT 105,
+/// IEEE 802.11) sur `/sdcard/loot/handshakes/`. Renvoie le chemin, ou `None`
+/// si rien n'a été capturé. Le fichier est lisible par Wireshark / aircrack-ng.
+fn save_handshakes_pcap(ssid: &str) -> anyhow::Result<Option<String>> {
+    use std::io::Write;
+    let frames = {
+        let mut g = CAPTURED.lock().map_err(|_| anyhow::anyhow!("CAPTURED lock"))?;
+        std::mem::take(&mut *g)
+    };
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all("/sdcard/loot/handshakes")?;
+    let safe: String = ssid
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(20)
+        .collect();
+    let name = if safe.is_empty() { "cap".to_string() } else { safe };
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = format!("/sdcard/loot/handshakes/{}-{}.pcap", name, n);
+
+    let mut f = std::fs::File::create(&path)?;
+    // En-tête global pcap (little-endian), network = 105 (LINKTYPE_IEEE802_11).
+    f.write_all(&0xa1b2c3d4u32.to_le_bytes())?; // magic
+    f.write_all(&2u16.to_le_bytes())?; // version major
+    f.write_all(&4u16.to_le_bytes())?; // version minor
+    f.write_all(&0i32.to_le_bytes())?; // thiszone
+    f.write_all(&0u32.to_le_bytes())?; // sigfigs
+    f.write_all(&65535u32.to_le_bytes())?; // snaplen
+    f.write_all(&105u32.to_le_bytes())?; // network (802.11)
+    for (i, fr) in frames.iter().enumerate() {
+        f.write_all(&(i as u32).to_le_bytes())?; // ts_sec (pas de RTC → index)
+        f.write_all(&0u32.to_le_bytes())?; // ts_usec
+        f.write_all(&(fr.len() as u32).to_le_bytes())?; // incl_len
+        f.write_all(&(fr.len() as u32).to_le_bytes())?; // orig_len
+        f.write_all(fr)?;
+    }
+    f.flush()?;
+    Ok(Some(path))
+}
+
 /// Passe en promiscuous sur le `channel` de la cible et affiche l'avancement de
 /// la capture du 4-way handshake. `target_ssid`/`channel` viennent du picker
 /// ([`super::scan::pick`]). `back` coupe la capture et rend le modem.
@@ -145,9 +204,12 @@ where
 {
     info!("=== Sniffer 802.11 / capture handshake — cible {} canal {} ===", target_ssid, channel);
 
-    // Remet les compteurs à zéro (statiques globaux réutilisés entre sessions).
+    // Remet les compteurs + le buffer de capture à zéro (statiques réutilisés).
     for c in [&N_TOTAL, &N_MGMT, &N_DATA, &N_EAPOL, &MSG_SEEN] {
         c.store(0, Ordering::Relaxed);
+    }
+    if let Ok(mut g) = CAPTURED.lock() {
+        g.clear();
     }
 
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
@@ -174,6 +236,16 @@ where
             unsafe {
                 esp_wifi_set_promiscuous_rx_cb(None);
                 esp_wifi_set_promiscuous(false);
+            }
+            // Sauve les EAPOL capturés en .pcap sur SD (lisible aircrack/Wireshark).
+            match save_handshakes_pcap(target_ssid) {
+                Ok(Some(path)) => {
+                    info!("Handshakes sauvés : {}", path);
+                    banner(display, "Capture handshake", "Sauve sur SD :", &path)?;
+                    FreeRtos::delay_ms(2000);
+                }
+                Ok(None) => info!("Aucun EAPOL capturé — rien à sauver"),
+                Err(e) => ::log::warn!("Sauvegarde .pcap KO: {:?}", e),
             }
             return Ok(());
         }
