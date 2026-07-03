@@ -25,7 +25,6 @@ use mipidsi::{models::ST7789, Builder};
 use storage::SdWrite;
 
 mod badusb;
-mod cli;
 mod logo;
 mod nfc;
 mod storage;
@@ -163,9 +162,6 @@ fn run_app() -> anyhow::Result<()> {
             None
         }
     };
-
-    // ── Console série (CLI) : accès SD + statut en parallèle du menu ──────────
-    cli::spawn();
 
     // ── WiFi / BadUSB : radio à la demande ───────────────────────────────────
     // Le modem n'est plus consommé au boot : il est emprunté par chaque outil
