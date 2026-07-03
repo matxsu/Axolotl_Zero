@@ -151,7 +151,17 @@ fn run_app() -> anyhow::Result<()> {
             .sda_enable_pullup(true) // On force le pull-up interne
             .scl_enable_pullup(true), // On force le pull-up interne
     )?;
-    let mut pn532 = nfc::Pn532::new(i2c)?;
+    // Init NFC NON-FATALE : si le PN532 ne répond pas (I²C timeout, jumper
+    // débranché sur breadboard…), on ne tue pas tout le device — le menu
+    // démarre quand même et WiFi/BadUSB/Storage restent utilisables. L'entrée
+    // NFC affichera "PN532 absent".
+    let mut pn532 = match nfc::Pn532::new(i2c) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::warn!("PN532 absent (NFC désactivé) : {:?}", e);
+            None
+        }
+    };
 
     // ── WiFi / BadUSB : radio à la demande ───────────────────────────────────
     // Le modem n'est plus consommé au boot : il est emprunté par chaque outil
@@ -246,17 +256,22 @@ fn run_app() -> anyhow::Result<()> {
                 .or_else(|| internal_fs.as_ref().map(|f| f as &dyn SdWrite));
 
             match selected {
-                0 => run_nfc_scan(
-                    &mut display,
-                    &mut pn532,
-                    storage,
-                    &mut last_dumps,
-                    &btn_mid,
-                    &btn_lft,
-                    &btn_up,
-                    &btn_dwn,
-                    &btn_rht,
-                )?,
+                0 => {
+                    if let Some(p) = pn532.as_mut() {
+                        run_nfc_scan(
+                            &mut display, p, storage, &mut last_dumps, &btn_mid, &btn_lft, &btn_up,
+                            &btn_dwn, &btn_rht,
+                        )?;
+                    } else {
+                        draw_wifi_info(&mut display, "NFC / RFID", "PN532 absent", "verifie I2C (GPIO3/4)")?;
+                        while !btn_lft.is_low() && !btn_mid.is_low() {
+                            FreeRtos::delay_ms(50);
+                        }
+                        while btn_lft.is_low() || btn_mid.is_low() {
+                            FreeRtos::delay_ms(10);
+                        }
+                    }
+                }
                 1 => run_wifi_menu(
                     &mut display,
                     &mut modem,
