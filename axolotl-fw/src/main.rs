@@ -37,7 +37,7 @@ const GRAY: Rgb565 = Rgb565::new(9, 22, 13);
 const BLACK: Rgb565 = Rgb565::BLACK;
 const GREEN: Rgb565 = Rgb565::new(0, 40, 0);
 
-const MENU_ITEMS: [&str; 4] = ["NFC / RFID", "WiFi Tools", "BadUSB", "Storage"];
+const MENU_ITEMS: [&str; 4] = ["NFC / RFID", "WiFi Tools", "BadBLE", "Storage"];
 
 #[derive(Default)]
 struct LastDumps {
@@ -130,15 +130,7 @@ fn run_app() -> anyhow::Result<()> {
             .sda_enable_pullup(true)
             .scl_enable_pullup(true),
     )?;
-    // gpio1 (ex-IRQ PN532) volontairement NON configurée : c'était le seul écart
-    // matériel avec rfid_attacks et ça déréglait la comm I²C du PN532.
-    let mut pn532 = match nfc::Pn532::new(i2c) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            log::warn!("PN532 absent (NFC désactivé) : {:?}", e);
-            None
-        }
-    };
+    let mut pn532 = nfc::Pn532::new(i2c)?;
 
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
@@ -226,32 +218,17 @@ fn run_app() -> anyhow::Result<()> {
                 .or_else(|| internal_fs.as_ref().map(|f| f as &dyn SdWrite));
             match selected {
                 0 => {
-                    if let Some(p) = pn532.as_mut() {
-                        run_nfc_scan(
-                            &mut display,
-                            p,
-                            storage,
-                            &mut last_dumps,
-                            &btn_mid,
-                            &btn_lft,
-                            &btn_up,
-                            &btn_dwn,
-                            &btn_rht,
-                        )?;
-                    } else {
-                        draw_wifi_info(
-                            &mut display,
-                            "NFC / RFID",
-                            "PN532 absent",
-                            "verifie I2C (GPIO3/4)",
-                        )?;
-                        while !btn_lft.is_low() && !btn_mid.is_low() {
-                            FreeRtos::delay_ms(50);
-                        }
-                        while btn_lft.is_low() || btn_mid.is_low() {
-                            FreeRtos::delay_ms(10);
-                        }
-                    }
+                    run_nfc_scan(
+                        &mut display,
+                        &mut pn532,
+                        storage,
+                        &mut last_dumps,
+                        &btn_mid,
+                        &btn_lft,
+                        &btn_up,
+                        &btn_dwn,
+                        &btn_rht,
+                    )?;
                 }
                 1 => run_wifi_menu(
                     &mut display,
@@ -639,12 +616,12 @@ where
         std::fs::read_to_string(badusb::payload_path(&sd_names[idx - builtins.len()]))
             .unwrap_or_default()
     };
-    draw_wifi_info(display, "BADUSB BLE", "Appairez :", "Axolotl Keyboard")?;
+    draw_wifi_info(display, "BadBLE", "Appairez :", "Axolotl Keyboard")?;
     match badusb::make_keyboard() {
         Ok(kb) => badusb::run_payload(kb, &script, btn_lft),
         Err(e) => {
-            log::warn!("BadUSB: init BLE KO: {:?}", e);
-            draw_wifi_info(display, "BADUSB BLE", "Erreur init BLE", "voir logs")?;
+            log::warn!("BadBLE: init BLE KO: {:?}", e);
+            draw_wifi_info(display, "BadBLE", "Erreur init BLE", "voir logs")?;
             while !btn_lft.is_low() && !btn_mid.is_low() {
                 FreeRtos::delay_ms(50);
             }
