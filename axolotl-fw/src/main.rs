@@ -39,24 +39,20 @@ const GREEN: Rgb565 = Rgb565::new(0, 40, 0);
 
 const MENU_ITEMS: [&str; 4] = ["NFC / RFID", "WiFi Tools", "BadUSB", "Storage"];
 
-/// Cache des derniers dumps en RAM — permet de re-cloner après être revenu
-/// au menu sans re-scanner la carte source. Reset à chaque reboot.
 #[derive(Default)]
 struct LastDumps {
     classic: Option<Box<nfc::MifareDump>>,
-    /// Clés trouvées au dump — nécessaires pour reconstruire les trailers au clone
-    /// (le dump renvoie KeyA masqué à 00).
     classic_keys: Vec<nfc::attacks::SectorKey>,
     ultralight: Option<Vec<u8>>,
 }
 
+pub(crate) fn anyhow_dbg<E: core::fmt::Debug>(e: E) -> anyhow::Error {
+    anyhow::anyhow!("{e:?}")
+}
 
 fn main() -> anyhow::Result<()> {
     link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    // Le main task IDF a un stack par défaut trop petit pour la chaîne de
-    // types génériques mipidsi + SPI + embedded-graphics.
-    // On délègue tout à un thread Rust avec 64 KB de stack.
     std::thread::Builder::new()
         .stack_size(65536)
         .spawn(run_app)?
@@ -66,15 +62,8 @@ fn main() -> anyhow::Result<()> {
 
 fn run_app() -> anyhow::Result<()> {
     log::info!("Axolotl Zero — booting...");
-
     let peripherals = esp_idf_hal::peripherals::Peripherals::take()?;
 
-    // ── SPI2 (partagé display + SD card) ─────────────────────────────────
-    // MOSI=11  SCK=12  MISO=13
-    // spi_driver déclaré en premier : dropé en dernier (après tous ses emprunteurs).
-
-    // DMA::Auto(4096) obligatoire : SD card transfère des blocs de 512 bytes,
-    // impossible sans DMA (FIFO SPI limité à 64 bytes sans DMA).
     let spi_driver = SpiDriver::new(
         peripherals.spi2,
         peripherals.pins.gpio12,
@@ -82,15 +71,8 @@ fn run_app() -> anyhow::Result<()> {
         Some(peripherals.pins.gpio13),
         &SpiDriverConfig::new().dma(Dma::Auto(4096)),
     )?;
-
-    // Pull-up interne ~45 kΩ sur MISO (GPIO13) APRÈS spi_bus_initialize()
-    // car l'init SPI reconfigure les pads GPIO et peut effacer les pull-ups.
-    // Remplacer par un 10 kΩ externe sur le PCB pour une solution robuste.
     unsafe { esp_idf_svc::sys::gpio_pullup_en(13) };
 
-    // ── SD card : CS=6 — initialisée EN PREMIER sur le bus (mode neutre) ──
-    // Si la SD s'initialise après le display (MODE_3), le bus SPI reste en
-    // MODE_3 et la SD (MODE_0) ne répond plus à ACMD41.
     let sd: Option<storage::SdStorage<'_, &SpiDriver<'_>>> =
         match storage::SdStorage::new(&spi_driver, peripherals.pins.gpio6.into()) {
             Ok(s) => {
@@ -103,7 +85,6 @@ fn run_app() -> anyhow::Result<()> {
             }
         };
 
-    // ── Flash interne FAT (fallback persistence quand SD absente) ─────────
     let internal_fs: Option<storage::InternalFs> = match storage::InternalFs::new() {
         Ok(fs) => Some(fs),
         Err(e) => {
@@ -112,7 +93,6 @@ fn run_app() -> anyhow::Result<()> {
         }
     };
 
-    // ── Display : CS=8, MODE_3, 40 MHz (après SD pour éviter conflits mode) ──
     let spi_device = SpiDeviceDriver::new(
         &spi_driver,
         Some(peripherals.pins.gpio8),
@@ -141,20 +121,17 @@ fn run_app() -> anyhow::Result<()> {
         .init(&mut FreeRtos)
         .map_err(|e| anyhow::anyhow!("Display init: {:?}", e))?;
 
-    // ── I2C + PN532 ───────────────────────────────────────────────────────
     let i2c = I2cDriver::new(
         peripherals.i2c0,
         peripherals.pins.gpio3,
         peripherals.pins.gpio4,
         &I2cConfig::new()
-            .baudrate(40_000_u32.Hz()) // On passe de 100 kHz à 40 kHz
-            .sda_enable_pullup(true) // On force le pull-up interne
-            .scl_enable_pullup(true), // On force le pull-up interne
+            .baudrate(40_000_u32.Hz())
+            .sda_enable_pullup(true)
+            .scl_enable_pullup(true),
     )?;
-    // Init NFC NON-FATALE : si le PN532 ne répond pas (I²C timeout, jumper
-    // débranché sur breadboard…), on ne tue pas tout le device — le menu
-    // démarre quand même et WiFi/BadUSB/Storage restent utilisables. L'entrée
-    // NFC affichera "PN532 absent".
+    // gpio1 (ex-IRQ PN532) volontairement NON configurée : c'était le seul écart
+    // matériel avec rfid_attacks et ça déréglait la comm I²C du PN532.
     let mut pn532 = match nfc::Pn532::new(i2c) {
         Ok(p) => Some(p),
         Err(e) => {
@@ -163,26 +140,18 @@ fn run_app() -> anyhow::Result<()> {
         }
     };
 
-    // ── WiFi / BadUSB : radio à la demande ───────────────────────────────────
-    // Le modem n'est plus consommé au boot : il est emprunté par chaque outil
-    // WiFi (scan / sniff / evil-twin / file browser), et libéré pour laisser le
-    // BLE (BadUSB) prendre le contrôleur radio.
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
     let mut modem = peripherals.modem;
-    // Le file browser n'étant plus lancé au boot, aucune IP AP permanente.
     let web_ip: Option<&str> = None;
 
-    // ── Joystick ──────────────────────────────────────────────────────────
     let btn_up = PinDriver::input(peripherals.pins.gpio15, Pull::Up)?;
     let btn_dwn = PinDriver::input(peripherals.pins.gpio16, Pull::Up)?;
     let btn_lft = PinDriver::input(peripherals.pins.gpio17, Pull::Up)?;
     let btn_rht = PinDriver::input(peripherals.pins.gpio18, Pull::Up)?;
-    // GPIO21 tiré à LOW en permanence (LED RGB interne ou court-circuit module) → GPIO14
     let btn_mid = PinDriver::input(peripherals.pins.gpio14, Pull::Up)?;
 
-    // ── Splash ────────────────────────────────────────────────────────────
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let logo_w = logo::LOGO_WIDTH as usize;
     let logo_h = logo::LOGO_HEIGHT as usize;
     let target_w = (logo_w * 2) as u16;
@@ -200,16 +169,18 @@ fn run_app() -> anyhow::Result<()> {
     log::info!("Splash OK ({}x{})", target_w, target_h);
     FreeRtos::delay_ms(1000);
 
-    // ── Menu ──────────────────────────────────────────────────────────────
     let mut selected: usize = 0;
     let mut last_dumps = LastDumps::default();
     draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
 
-    // Front descendant pour MID : ne déclenche que sur transition HIGH→LOW.
     let mut mid_prev_low = btn_mid.is_low();
     loop {
         if btn_up.is_low() {
-            selected = if selected == 0 { MENU_ITEMS.len() - 1 } else { selected - 1 };
+            selected = if selected == 0 {
+                MENU_ITEMS.len() - 1
+            } else {
+                selected - 1
+            };
             draw_submenu(&mut display, "AXOLOTL ZERO", &MENU_ITEMS, selected)?;
             while btn_up.is_low() {
                 FreeRtos::delay_ms(10);
@@ -244,7 +215,6 @@ fn run_app() -> anyhow::Result<()> {
         let mid_edge = mid_cur_low && !mid_prev_low;
         mid_prev_low = mid_cur_low;
         if mid_edge {
-            // attend le relâchement, timeout 500ms au cas où bouton coincé
             let mut t = 0u32;
             while btn_mid.is_low() && t < 50 {
                 FreeRtos::delay_ms(10);
@@ -254,16 +224,27 @@ fn run_app() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|s| s as &dyn SdWrite)
                 .or_else(|| internal_fs.as_ref().map(|f| f as &dyn SdWrite));
-
             match selected {
                 0 => {
                     if let Some(p) = pn532.as_mut() {
                         run_nfc_scan(
-                            &mut display, p, storage, &mut last_dumps, &btn_mid, &btn_lft, &btn_up,
-                            &btn_dwn, &btn_rht,
+                            &mut display,
+                            p,
+                            storage,
+                            &mut last_dumps,
+                            &btn_mid,
+                            &btn_lft,
+                            &btn_up,
+                            &btn_dwn,
+                            &btn_rht,
                         )?;
                     } else {
-                        draw_wifi_info(&mut display, "NFC / RFID", "PN532 absent", "verifie I2C (GPIO3/4)")?;
+                        draw_wifi_info(
+                            &mut display,
+                            "NFC / RFID",
+                            "PN532 absent",
+                            "verifie I2C (GPIO3/4)",
+                        )?;
                         while !btn_lft.is_low() && !btn_mid.is_low() {
                             FreeRtos::delay_ms(50);
                         }
@@ -306,16 +287,15 @@ fn run_app() -> anyhow::Result<()> {
     }
 }
 
-// ── NFC scan ───────────────────────────────────────────────────────────────
+const WIFI_ITEMS: &[&str; 6] = &[
+    "Axolotl Scan",
+    "Axolotl Twin",
+    "Axolotl Sniffer",
+    "Axolotl Browser",
+    "Axolotl keypass",
+    "Retour",
+];
 
-// ── Sous-menu WiFi Tools ───────────────────────────────────────────────────
-
-const WIFI_ITEMS: &[&str; 6] =
-    &["Scan reseaux", "Evil twin", "Sniff / Deauth", "File browser", "Creds captures", "Retour"];
-
-/// Sous-menu WiFi : chaque outil emprunte le modem (`split_reborrow`) le temps
-/// de son écran puis le rend au retour — aucun outil ne tourne en fond, ce qui
-/// libère la radio pour le suivant (ou pour le BLE du BadUSB).
 #[allow(clippy::too_many_arguments)]
 fn run_wifi_menu<D>(
     display: &mut D,
@@ -337,7 +317,11 @@ where
     let mut mid_prev = btn_mid.is_low();
     loop {
         if btn_up.is_low() {
-            sel = if sel == 0 { WIFI_ITEMS.len() - 1 } else { sel - 1 };
+            sel = if sel == 0 {
+                WIFI_ITEMS.len() - 1
+            } else {
+                sel - 1
+            };
             draw_submenu(display, "WIFI TOOLS", WIFI_ITEMS, sel)?;
             while btn_up.is_low() {
                 FreeRtos::delay_ms(10);
@@ -351,7 +335,6 @@ where
             }
         }
         if btn_lft.is_low() {
-            // Gauche = retour direct au menu principal.
             while btn_lft.is_low() {
                 FreeRtos::delay_ms(10);
             }
@@ -368,29 +351,40 @@ where
             }
             match sel {
                 0 => {
-                    // Scan (affichage en boucle).
                     let (wm, _bt) = modem.split_reborrow();
-                    if let Err(e) = wifi::scan::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft) {
+                    if let Err(e) =
+                        wifi::scan::run(wm, sysloop.clone(), nvs.clone(), display, btn_lft)
+                    {
                         wifi_tool_error(display, "SCAN", &e)?;
                     }
                 }
                 1 => {
-                    // Evil twin : choisir un réseau à cloner, puis un portail SD.
-                    // Le 1er reborrow est scopé pour libérer le modem avant le 2e.
                     let picked = {
                         let (wm, _bt) = modem.split_reborrow();
-                        wifi::scan::pick(wm, sysloop.clone(), nvs.clone(), display, btn_up, btn_dwn, btn_mid, btn_lft)
+                        wifi::scan::pick(
+                            wm,
+                            sysloop.clone(),
+                            nvs.clone(),
+                            display,
+                            btn_up,
+                            btn_dwn,
+                            btn_mid,
+                            btn_lft,
+                        )
                     };
                     match picked {
                         Ok(Some(choice)) => {
-                            if let Some(site) = wifi::portals::pick(display, btn_up, btn_dwn, btn_mid, btn_lft)? {
-                                let path = wifi::portals::html_path(&site);
-                                let (wm2, _bt2) = modem.split_reborrow();
-                                if let Err(e) = wifi::eviltwin::run(
-                                    wm2, sysloop.clone(), nvs.clone(), display, btn_lft, &choice.ssid, &path,
-                                ) {
-                                    wifi_tool_error(display, "EVIL TWIN", &e)?;
-                                }
+                            let (wm2, _bt2) = modem.split_reborrow();
+                            if let Err(e) = wifi::eviltwin::run(
+                                wm2,
+                                sysloop.clone(),
+                                nvs.clone(),
+                                display,
+                                btn_lft,
+                                &choice.ssid,
+                                "",
+                            ) {
+                                wifi_tool_error(display, "EVIL TWIN", &e)?;
                             }
                         }
                         Ok(None) => {}
@@ -398,16 +392,30 @@ where
                     }
                 }
                 2 => {
-                    // Sniff : choisir un réseau, capturer sur son canal.
                     let picked = {
                         let (wm, _bt) = modem.split_reborrow();
-                        wifi::scan::pick(wm, sysloop.clone(), nvs.clone(), display, btn_up, btn_dwn, btn_mid, btn_lft)
+                        wifi::scan::pick(
+                            wm,
+                            sysloop.clone(),
+                            nvs.clone(),
+                            display,
+                            btn_up,
+                            btn_dwn,
+                            btn_mid,
+                            btn_lft,
+                        )
                     };
                     match picked {
                         Ok(Some(choice)) => {
                             let (wm2, _bt2) = modem.split_reborrow();
                             if let Err(e) = wifi::sniff::run(
-                                wm2, sysloop.clone(), nvs.clone(), display, btn_lft, &choice.ssid, choice.channel,
+                                wm2,
+                                sysloop.clone(),
+                                nvs.clone(),
+                                display,
+                                btn_lft,
+                                &choice.ssid,
+                                choice.channel,
                             ) {
                                 wifi_tool_error(display, "SNIFF", &e)?;
                             }
@@ -417,7 +425,6 @@ where
                     }
                 }
                 3 => {
-                    // File browser : AP + HTTP tant qu'on ne fait pas "retour".
                     let (wm, _bt) = modem.split_reborrow();
                     match wifi::WebServer::start(wm, sysloop.clone(), nvs.clone()) {
                         Ok(_srv) => {
@@ -425,15 +432,13 @@ where
                             while !btn_lft.is_low() {
                                 FreeRtos::delay_ms(50);
                             }
-                            // _srv drop ici → modem rendu.
                         }
                         Err(e) => wifi_tool_error(display, "FILE BROWSER", &e)?,
                     }
                 }
                 4 => run_creds_viewer(display, btn_up, btn_dwn, btn_lft)?,
-                _ => return Ok(()), // Retour
+                _ => return Ok(()),
             }
-            // Absorbe le relâchement du bouton retour puis redessine le sous-menu.
             while btn_lft.is_low() {
                 FreeRtos::delay_ms(10);
             }
@@ -443,8 +448,6 @@ where
     }
 }
 
-/// Garde-fou : affiche un écran d'erreur (au lieu de propager/planter) quand un
-/// outil WiFi échoue — typiquement `ESP_ERR_NO_MEM`. Détail dans les logs.
 fn wifi_tool_error<D>(display: &mut D, title: &str, e: &anyhow::Error) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
@@ -456,8 +459,6 @@ where
     Ok(())
 }
 
-/// Écran de consultation des credentials capturés (`/sdcard/loot/creds.csv`).
-/// UP/DOWN défilent, gauche = retour.
 fn run_creds_viewer<D>(
     display: &mut D,
     btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
@@ -469,9 +470,18 @@ where
     D::Error: core::fmt::Debug,
 {
     let content = std::fs::read_to_string("/sdcard/loot/creds.csv").unwrap_or_default();
-    let lines: Vec<String> = content.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<String> = content
+        .lines()
+        .map(|l| l.to_string())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     if lines.is_empty() {
-        draw_wifi_info(display, "CREDS", "Aucun credential", "capture pour l'instant")?;
+        draw_wifi_info(
+            display,
+            "CREDS",
+            "Aucun credential",
+            "capture pour l'instant",
+        )?;
         while !btn_lft.is_low() {
             FreeRtos::delay_ms(50);
         }
@@ -480,7 +490,6 @@ where
         }
         return Ok(());
     }
-
     let mut top = 0usize;
     draw_creds(display, &lines, top)?;
     loop {
@@ -510,36 +519,40 @@ where
     }
 }
 
-/// Affiche les creds à partir de l'index `top` (une ligne CSV par row).
 fn draw_creds<D>(display: &mut D, lines: &[String], top: usize) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
     const VISIBLE: usize = 9;
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     Rectangle::new(Point::new(0, 0), Size::new(240, 30))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     let title = format!("CREDS  {}/{}", (top + 1).min(lines.len()), lines.len());
-    Text::new(&title, Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    Text::new(
+        &title,
+        Point::new(8, 19),
+        MonoTextStyle::new(&FONT_6X10, ORANGE),
+    )
+    .draw(display)
+    .map_err(anyhow_dbg)?;
     let mut y = 44i32;
     for line in lines.iter().skip(top).take(VISIBLE) {
-        // Découpe par caractères (pas d'index d'octet → pas de panic UTF-8).
         let shown: String = line.chars().take(39).collect();
-        Text::new(&shown, Point::new(6, y), MonoTextStyle::new(&FONT_6X10, WHITE))
-            .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(
+            &shown,
+            Point::new(6, y),
+            MonoTextStyle::new(&FONT_6X10, WHITE),
+        )
+        .draw(display)
+        .map_err(anyhow_dbg)?;
         y += 20;
     }
     Ok(())
 }
 
-/// Sélection générique dans une liste via le menu scrollable ([`draw_submenu`]).
-/// UP/DOWN naviguent, MID valide (renvoie l'index), gauche annule (`None`).
 #[allow(clippy::too_many_arguments)]
 fn select_from_list<D>(
     display: &mut D,
@@ -590,7 +603,6 @@ where
     }
 }
 
-/// Écran BadUSB : choisir un payload DuckyScript sur SD, puis clavier HID BLE.
 fn run_badusb<D>(
     display: &mut D,
     btn_up: &PinDriver<'_, esp_idf_hal::gpio::Input>,
@@ -602,10 +614,13 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    // 1. Choisir un payload sur SD (/sdcard/payloads/*.txt).
-    let names = badusb::list_payloads();
-    if names.is_empty() {
-        draw_wifi_info(display, "BADUSB", "Aucun payload SD", "cf /sdcard/payloads/")?;
+    let builtins = badusb::BUILTIN_PAYLOADS;
+    let sd_names = badusb::list_payloads();
+    let mut labels: Vec<String> = builtins.iter().map(|(n, _)| format!("[FW] {n}")).collect();
+    labels.extend(sd_names.iter().map(|n| format!("[SD] {n}")));
+    let refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+    if refs.is_empty() {
+        draw_wifi_info(display, "BADUSB", "Aucun payload", "ajouter .txt sur SD")?;
         while !btn_lft.is_low() && !btn_mid.is_low() {
             FreeRtos::delay_ms(50);
         }
@@ -614,13 +629,16 @@ where
         }
         return Ok(());
     }
-    let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let Some(idx) = select_from_list(display, "PAYLOAD", &refs, btn_up, btn_dwn, btn_mid, btn_lft)? else {
+    let Some(idx) = select_from_list(display, "PAYLOAD", &refs, btn_up, btn_dwn, btn_mid, btn_lft)?
+    else {
         return Ok(());
     };
-    let script = std::fs::read_to_string(badusb::payload_path(&names[idx])).unwrap_or_default();
-
-    // 2. Init clavier BLE + exécution (libère le BLE à la sortie).
+    let script: String = if idx < builtins.len() {
+        builtins[idx].1.to_string()
+    } else {
+        std::fs::read_to_string(badusb::payload_path(&sd_names[idx - builtins.len()]))
+            .unwrap_or_default()
+    };
     draw_wifi_info(display, "BADUSB BLE", "Appairez :", "Axolotl Keyboard")?;
     match badusb::make_keyboard() {
         Ok(kb) => badusb::run_payload(kb, &script, btn_lft),
@@ -635,91 +653,134 @@ where
     Ok(())
 }
 
-/// Menu générique **scrollable** : barre de titre (avec compteur `sel/total`),
-/// fenêtre glissante de [`MENU_VISIBLE`] items, flèches ^/v si débordement.
-/// Utilisé par le menu principal ET les sous-menus (WiFi, etc.).
 const MENU_VISIBLE: usize = 5;
 
-fn draw_submenu<D>(display: &mut D, title: &str, items: &[&str], selected: usize) -> anyhow::Result<()>
+fn draw_submenu<D>(
+    display: &mut D,
+    title: &str,
+    items: &[&str],
+    selected: usize,
+) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Rectangle::new(Point::new(0, 0), Size::new(240, 30))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::with_text_style(title, Point::new(120, 22), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    // Compteur position (ex. 2/6) à droite si ça déborde.
+        .map_err(anyhow_dbg)?;
+    Text::with_text_style(
+        title,
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(anyhow_dbg)?;
     if items.len() > MENU_VISIBLE {
         let counter = format!("{}/{}", selected + 1, items.len());
-        Text::new(&counter, Point::new(196, 20), MonoTextStyle::new(&FONT_6X10, WHITE))
-            .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(
+            &counter,
+            Point::new(196, 20),
+            MonoTextStyle::new(&FONT_6X10, WHITE),
+        )
+        .draw(display)
+        .map_err(anyhow_dbg)?;
     }
-
-    // Fenêtre glissante centrée autour de la sélection.
     let start = if items.len() <= MENU_VISIBLE {
         0
     } else {
-        selected.saturating_sub(MENU_VISIBLE / 2).min(items.len() - MENU_VISIBLE)
+        selected
+            .saturating_sub(MENU_VISIBLE / 2)
+            .min(items.len() - MENU_VISIBLE)
     };
     for (row, i) in (start..items.len()).take(MENU_VISIBLE).enumerate() {
         let y = 40 + row as i32 * 38;
-        let (bg, fg) = if i == selected { (ORANGE, BLACK) } else { (BG, WHITE) };
+        let (bg, fg) = if i == selected {
+            (ORANGE, BLACK)
+        } else {
+            (BG, WHITE)
+        };
         Rectangle::new(Point::new(10, y), Size::new(220, 30))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Text::new(items[i], Point::new(20, y + 21), MonoTextStyle::new(&FONT_10X20, fg))
-            .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
+        Text::new(
+            items[i],
+            Point::new(20, y + 21),
+            MonoTextStyle::new(&FONT_10X20, fg),
+        )
+        .draw(display)
+        .map_err(anyhow_dbg)?;
     }
-    // Flèches de défilement.
     if start > 0 {
-        Text::new("^", Point::new(224, 44), MonoTextStyle::new(&FONT_6X10, ORANGE))
-            .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(
+            "^",
+            Point::new(224, 44),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+        )
+        .draw(display)
+        .map_err(anyhow_dbg)?;
     }
     if start + MENU_VISIBLE < items.len() {
-        Text::new("v", Point::new(224, 230), MonoTextStyle::new(&FONT_6X10, ORANGE))
-            .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        Text::new(
+            "v",
+            Point::new(224, 230),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+        )
+        .draw(display)
+        .map_err(anyhow_dbg)?;
     }
     Ok(())
 }
 
-/// Écran d'info à 2 lignes (titre + 2 lignes), pour file browser / BadUSB.
 fn draw_wifi_info<D>(display: &mut D, title: &str, l1: &str, l2: &str) -> anyhow::Result<()>
 where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Rectangle::new(Point::new(0, 0), Size::new(240, 30))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::with_text_style(title, Point::new(120, 22), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::with_text_style(l1, Point::new(120, 110), MonoTextStyle::new(&FONT_10X20, WHITE), centered)
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::with_text_style(l2, Point::new(120, 140), MonoTextStyle::new(&FONT_10X20, ORANGE), centered)
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::with_text_style("< retour", Point::new(120, 220), MonoTextStyle::new(&FONT_10X20, GRAY), centered)
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
+    Text::with_text_style(
+        title,
+        Point::new(120, 22),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(anyhow_dbg)?;
+    Text::with_text_style(
+        l1,
+        Point::new(120, 110),
+        MonoTextStyle::new(&FONT_10X20, WHITE),
+        centered,
+    )
+    .draw(display)
+    .map_err(anyhow_dbg)?;
+    Text::with_text_style(
+        l2,
+        Point::new(120, 140),
+        MonoTextStyle::new(&FONT_10X20, ORANGE),
+        centered,
+    )
+    .draw(display)
+    .map_err(anyhow_dbg)?;
+    Text::with_text_style(
+        "< retour",
+        Point::new(120, 220),
+        MonoTextStyle::new(&FONT_10X20, GRAY),
+        centered,
+    )
+    .draw(display)
+    .map_err(anyhow_dbg)?;
     Ok(())
 }
-
 fn run_nfc_scan<D>(
     display: &mut D,
     pn532: &mut nfc::Pn532,
@@ -735,6 +796,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
+    log::info!("===== NFC · SCAN UID =====");
     draw_nfc_screen_with_cache(
         display,
         None,
@@ -990,9 +1052,38 @@ where
                 }
                 FreeRtos::delay_ms(20);
             }
+            // Dump TOTALEMENT vide = carte perdue en cours de route (auth ratée →
+            // HALT, puis re_select en échec ×5). Le bus PN532 a enchaîné des
+            // dizaines de rf_cycle et reste souvent désync → le simple
+            // reset_field() fait au retour dans run_nfc_scan ne suffit pas et le
+            // scan suivant reste mort ("plus scanner de badge après un dump raté").
+            //
+            // On force la récupération lourde (drain I2C agressif + SAM +
+            // MaxRetries). Un SEUL recover ne suffit pas toujours : au boot il en
+            // faut ~4 avant que le 1er read_uid cesse de renvoyer une erreur de
+            // comm. On répète donc TANT QUE read_uid erre encore ; Ok(None) = bus
+            // sain sans carte → on s'arrête. Borné à 5 essais.
+            //
+            // Ciblé : ne s'exécute QUE sur l'échec total, jamais sur le chemin
+            // par-carte sain (cf. note reset_field/recover dans run_nfc_scan) ni
+            // sur un dump partiel exploitable.
+            if readable_count == 0 {
+                log::warn!("Dump vide — recover PN532 pour rétablir le scan");
+                for essai in 1..=5 {
+                    pn532.recover();
+                    if !matches!(pn532.read_uid(), Err(_)) {
+                        break;
+                    }
+                    log::warn!("recover post-dump {}/5 : read_uid erre encore", essai);
+                }
+            }
             last_dumps.classic = Some(dump);
             last_dumps.classic_keys = found_keys;
         }
+        // `mifare_dump` renvoie toujours Ok (dump_all_sectors donne un tuple, pas
+        // de `?`) : une carte perdue revient en Ok avec readable_count==0, géré
+        // ci-dessus. Cette branche est donc actuellement inatteignable — conservée
+        // au cas où mifare_dump gagnerait un `?` un jour.
         Err(e) => {
             log::warn!("Dump err: {:?}", e);
             draw_nfc_status(display, "Dump echoue")?;
@@ -1015,12 +1106,12 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Rectangle::new(Point::new(0, 0), Size::new(240, 30))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     Text::with_text_style(
         "NFC ATTACK",
         Point::new(120, 22),
@@ -1028,7 +1119,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     for (i, label) in ATTACK_ITEMS.iter().enumerate() {
         let y = 40 + i as i32 * 48;
@@ -1040,14 +1131,14 @@ where
         Rectangle::new(Point::new(10, y), Size::new(220, 38))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(bg).build())
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
         Text::new(
             label,
             Point::new(20, y + 26),
             MonoTextStyle::new(&FONT_10X20, fg),
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
     Ok(())
 }
@@ -1148,7 +1239,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -1158,7 +1249,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let msg = format!("{}/{} blocs lus", readable, total);
     Text::with_text_style(
@@ -1168,7 +1259,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let acl_summary = format!(
         "ACL fact:{} cust:{} corr:{}",
@@ -1181,7 +1272,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     if show_attack_hint {
         Text::with_text_style(
@@ -1191,7 +1282,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
         Text::with_text_style(
             "DWN: Attaques crypto",
             Point::new(120, 220),
@@ -1199,7 +1290,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     } else {
         Text::with_text_style(
             "MID: clone  DWN: attack",
@@ -1208,7 +1299,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
     Ok(())
 }
@@ -1363,6 +1454,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
+    log::info!("===== NFC · CLONE MAGIC =====");
     draw_nfc_status(display, "Approche carte magic\n(gen2/gen1a/CUID)...")?;
 
     // Attente de la carte cible — 30s timeout
@@ -1637,7 +1729,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Text::with_text_style(
         "EMULATION",
@@ -1646,7 +1738,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let stem = dump_stem(name);
     Text::with_text_style(
@@ -1656,7 +1748,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     // L'émulation bloque sur TgInitAsTarget tant qu'aucun lecteur n'active la
     // cible : l'écran affiche la consigne pendant toute la fenêtre d'attente.
@@ -1666,7 +1758,7 @@ where
         Rectangle::new(Point::new(0, 85), Size::new(240, 30))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(BG).build())
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
         Text::with_text_style(
             line,
             Point::new(120, 105),
@@ -1674,7 +1766,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
         Ok(())
     };
     draw_status(display, &status_line)?;
@@ -1702,7 +1794,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -1712,7 +1804,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     // Fenêtre glissante de 7 entrées autour de la sélection.
     const VISIBLE: usize = 7;
@@ -1733,7 +1825,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
 
     Text::with_text_style(
@@ -1743,7 +1835,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Ok(())
 }
 
@@ -1757,7 +1849,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -1767,7 +1859,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let stem = dump_stem(name);
     Text::with_text_style(
@@ -1777,7 +1869,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let info = format!("{:?}  {} blocs", dump.card_type, dump.total_blocks());
     Text::with_text_style(
@@ -1787,7 +1879,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let keys_line = format!("{} cles dispo", key_count);
     Text::with_text_style(
@@ -1797,7 +1889,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Text::with_text_style(
         "UP: emuler badge",
@@ -1806,7 +1898,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Text::with_text_style(
         "MID: cloner (carte magic)",
         Point::new(120, 195),
@@ -1814,7 +1906,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Text::with_text_style(
         "DOWN: voir blocs  LFT: retour",
         Point::new(120, 215),
@@ -1822,7 +1914,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Ok(())
 }
 
@@ -1921,7 +2013,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -1931,7 +2023,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let title = format!("Page {:03} / {:03}", page, total - 1);
     Text::with_text_style(
@@ -1941,7 +2033,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let off = page * 4;
     let d = data.get(off..off + 4).unwrap_or(&[0, 0, 0, 0]);
@@ -1953,7 +2045,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let mut ascii = String::with_capacity(4);
     for &b in d.iter() {
@@ -1970,7 +2062,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Text::with_text_style(
         "UP/DOWN: navigate",
@@ -1979,7 +2071,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Text::with_text_style(
         "LFT: retour",
         Point::new(120, 220),
@@ -1987,7 +2079,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Ok(())
 }
@@ -1997,7 +2089,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -2007,7 +2099,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let title = format!("Bloc {:03} / {:03}", block, dump.total_blocks() - 1);
     Text::with_text_style(
@@ -2017,7 +2109,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     if !dump.readable[block] {
         Text::with_text_style(
@@ -2027,7 +2119,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     } else {
         let d = &dump.blocks[block];
         let line1 = format!(
@@ -2045,7 +2137,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
         Text::with_text_style(
             &line2,
             Point::new(120, 120),
@@ -2053,7 +2145,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
 
         // Représentation ASCII (caractères imprimables uniquement)
         let mut ascii = String::with_capacity(16);
@@ -2071,7 +2163,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
 
     Text::with_text_style(
@@ -2081,7 +2173,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Text::with_text_style(
         "LFT: retour",
         Point::new(120, 220),
@@ -2089,7 +2181,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Ok(())
 }
@@ -2270,7 +2362,7 @@ where
     let data = match std::fs::read(full_path) {
         Ok(d) => d,
         Err(e) => {
-            display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            display.clear(BG).map_err(anyhow_dbg)?;
             let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
             let msg = format!("Erreur: {}", e);
             Text::with_text_style(
@@ -2280,7 +2372,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             FreeRtos::delay_ms(2000);
             return Ok(());
         }
@@ -2312,13 +2404,13 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Rectangle::new(Point::new(0, 0), Size::new(240, 28))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     Text::with_text_style(
         "STORAGE",
         Point::new(120, 21),
@@ -2326,7 +2418,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let display_path: String = if path.chars().count() > 32 {
         path.chars().skip(path.chars().count() - 32).collect()
@@ -2340,7 +2432,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     if entries.is_empty() {
         Text::with_text_style(
@@ -2350,7 +2442,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     } else {
         let count = BROWSER_VISIBLE.min(entries.len().saturating_sub(scroll));
         for i in 0..count {
@@ -2363,7 +2455,7 @@ where
                 Rectangle::new(Point::new(0, y - 11), Size::new(240, 20))
                     .into_styled(PrimitiveStyleBuilder::new().fill_color(ORANGE).build())
                     .draw(display)
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                    .map_err(anyhow_dbg)?;
             }
 
             let txt_color = if is_sel {
@@ -2396,7 +2488,7 @@ where
                 MonoTextStyle::new(&FONT_6X10, txt_color),
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
         }
 
         if entries.len() > BROWSER_VISIBLE {
@@ -2408,7 +2500,7 @@ where
                 TextStyleBuilder::new().alignment(Alignment::Right).build(),
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
         }
     }
 
@@ -2419,7 +2511,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     if let Some(ip) = web_ip {
         let ip_line = format!("WiFi: {}", ip);
@@ -2430,7 +2522,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
 
     Ok(())
@@ -2501,7 +2593,7 @@ where
 {
     const BYTES_PER_ROW: usize = 8;
     const ROWS_PER_PAGE: usize = 9;
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     let hdr = if name.len() > 26 {
@@ -2522,7 +2614,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     for r in 0..ROWS_PER_PAGE {
         let row = row_offset + r;
@@ -2542,7 +2634,7 @@ where
             MonoTextStyle::new(&FONT_6X10, WHITE),
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
 
     let byte_pos = row_offset * BYTES_PER_ROW;
@@ -2559,7 +2651,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Ok(())
 }
@@ -2584,7 +2676,7 @@ where
             centered,
         )
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
     }
     Ok(())
 }
@@ -2598,7 +2690,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Text::with_text_style(
         "NFC / RFID",
@@ -2607,7 +2699,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     match uid {
         Some(hex) => {
             Text::with_text_style(
@@ -2617,7 +2709,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             if let Some(t) = card_type {
                 Text::with_text_style(
                     t,
@@ -2626,7 +2718,7 @@ where
                     centered,
                 )
                 .draw(display)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .map_err(anyhow_dbg)?;
             }
             Text::with_text_style(
                 "UID:",
@@ -2635,7 +2727,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             Text::with_text_style(
                 hex.as_str(),
                 Point::new(120, 155),
@@ -2643,7 +2735,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             let hint = match card_type {
                 Some(t) if t.contains("Classic") => "MID: dump  LFT: retour",
                 Some(_) => "MID: lire  LFT: retour",
@@ -2656,7 +2748,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
         }
         None => {
             Text::with_text_style(
@@ -2666,7 +2758,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             Text::with_text_style(
                 "Approche une carte NFC",
                 Point::new(120, 140),
@@ -2674,7 +2766,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             Text::with_text_style(
                 "RIGHT: dumps sauves",
                 Point::new(120, 175),
@@ -2682,7 +2774,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
             Text::with_text_style(
                 "LFT: retour",
                 Point::new(120, 220),
@@ -2690,7 +2782,7 @@ where
                 centered,
             )
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
         }
     }
     Ok(())
@@ -2701,7 +2793,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -2711,7 +2803,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let msg = format!("{} pages lues", pages);
     Text::with_text_style(
@@ -2721,7 +2813,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Text::with_text_style(
         "clone: NTAG/UL cible",
@@ -2730,7 +2822,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Text::with_text_style(
         "MID: cloner  LFT: retour",
@@ -2739,7 +2831,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Ok(())
 }
@@ -2749,7 +2841,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
 
     Text::with_text_style(
@@ -2759,7 +2851,7 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     let msg = format!("Secteur {}/{}", sector + 1, total);
     Text::with_text_style(
@@ -2769,12 +2861,12 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
 
     Rectangle::new(Point::new(20, 150), Size::new(200, 14))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(anyhow_dbg)?;
 
     let t = total.max(1) as u32;
     let filled = ((sector as u32 + 1) * 200 / t).min(200);
@@ -2782,7 +2874,7 @@ where
         Rectangle::new(Point::new(20, 150), Size::new(filled, 14))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(ORANGE).build())
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(anyhow_dbg)?;
     }
 
     Ok(())
@@ -2793,7 +2885,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(anyhow_dbg)?;
     let centered = TextStyleBuilder::new().alignment(Alignment::Center).build();
     Text::with_text_style(
         msg,
@@ -2802,8 +2894,6 @@ where
         centered,
     )
     .draw(display)
-    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    .map_err(anyhow_dbg)?;
     Ok(())
 }
-
-

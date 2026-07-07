@@ -68,7 +68,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    info!("=== Demarrage du scanner WiFi ===");
+    info!("===== WIFI · SCAN RESEAUX =====");
     banner(display, "Scan en cours...")?;
     let mut wifi = BlockingWifi::wrap(EspWifi::new(modem, sys_loop.clone(), Some(nvs))?, sys_loop)?;
     wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
@@ -83,18 +83,18 @@ where
         let reseaux = wifi.scan()?;
         info!("{} reseaux trouves", reseaux.len());
 
-        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        display.clear(BG).map_err(crate::anyhow_dbg)?;
         Rectangle::new(Point::new(0, 0), Size::new(240, 30))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(crate::anyhow_dbg)?;
         Text::new("Scan WiFi", Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(crate::anyhow_dbg)?;
         let total = format!("{} res.", reseaux.len());
         Text::new(&total, Point::new(180, 19), MonoTextStyle::new(&FONT_6X10, WHITE))
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(crate::anyhow_dbg)?;
 
         let style = MonoTextStyle::new(&FONT_6X10, WHITE);
         let style_dim = MonoTextStyle::new(&FONT_6X10, DIM);
@@ -104,7 +104,7 @@ where
             let txt = format!("{:<14.14} c{:<2} {}", ap.ssid.as_str(), ap.channel, auth_court(ap.auth_method));
             Text::new(&txt, Point::new(6, y), style)
                 .draw(display)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .map_err(crate::anyhow_dbg)?;
 
             // Barres de signal a droite
             let n = barres(ap.signal_strength);
@@ -123,7 +123,7 @@ where
                 Rectangle::new(Point::new(bx, by), Size::new(5, h as u32))
                     .into_styled(PrimitiveStyleBuilder::new().fill_color(col).build())
                     .draw(display)
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                    .map_err(crate::anyhow_dbg)?;
             }
 
             // Ligne 2 : BSSID complet (MAC de l AP)
@@ -134,7 +134,7 @@ where
             );
             Text::new(&mac, Point::new(6, y + 11), style_dim)
                 .draw(display)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .map_err(crate::anyhow_dbg)?;
 
             info!(
                 "  {} | {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} | canal {} | {} dBm | {:?}",
@@ -158,10 +158,10 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(crate::anyhow_dbg)?;
     Text::new(msg, Point::new(40, 120), MonoTextStyle::new(&FONT_6X10, WHITE))
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(crate::anyhow_dbg)?;
     Ok(())
 }
 
@@ -261,15 +261,15 @@ where
     D::Error: core::fmt::Debug,
 {
     const VISIBLE: usize = 8;
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(crate::anyhow_dbg)?;
     Rectangle::new(Point::new(0, 0), Size::new(240, 30))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(crate::anyhow_dbg)?;
     let title = format!("CIBLE  {}/{}", selected + 1, choices.len());
     Text::new(&title, Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(crate::anyhow_dbg)?;
 
     // Fenêtre de défilement centrée autour de la sélection.
     let start = selected.saturating_sub(VISIBLE - 1).min(choices.len().saturating_sub(VISIBLE));
@@ -280,13 +280,13 @@ where
             Rectangle::new(Point::new(4, y - 10), Size::new(232, 22))
                 .into_styled(PrimitiveStyleBuilder::new().fill_color(ORANGE).build())
                 .draw(display)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .map_err(crate::anyhow_dbg)?;
         }
         let fg = if is_sel { BG } else { WHITE };
         let line = format!("{:<18.18} c{}", c.ssid, c.channel);
         Text::new(&line, Point::new(8, y + 5), MonoTextStyle::new(&FONT_6X10, fg))
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(crate::anyhow_dbg)?;
         y += 24;
     }
     Ok(())
