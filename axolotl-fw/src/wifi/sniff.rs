@@ -1,23 +1,11 @@
 //! Sniffer 802.11 en mode promiscuous + détection de handshake WPA (EAPOL).
-//!
-//! Porté depuis `feature/wifi_attacks:src/wifi_sniff.rs`. Adaptations menu :
-//!   - `modem` emprunté (`impl Peripheral`) ;
-//!   - bouton retour (`back`) : coupe le mode promiscuous et rend le modem.
-//!
-//! NOTE : la box ciblée est codée en dur (`BOX_SSID`/`CANAL_DEFAUT`) — hérité
-//! du code de démo, à paramétrer plus tard.
+//! Sauvegarde PCAP sur flash interne (/spiflash) ou SD.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use esp_idf_svc::eventloop::EspSystemEventLoop;
-use esp_idf_svc::hal::delay::FreeRtos;
-use esp_idf_svc::hal::gpio::{Input, PinDriver};
-use esp_idf_svc::hal::modem::WifiModemPeripheral;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::sys::*;
-use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+use ::log::info;
 use embedded_graphics::{
     mono_font::{ascii::FONT_6X10, MonoTextStyle},
     pixelcolor::Rgb565,
@@ -25,7 +13,13 @@ use embedded_graphics::{
     primitives::{PrimitiveStyleBuilder, Rectangle},
     text::Text,
 };
-use ::log::info;
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::hal::delay::FreeRtos;
+use esp_idf_svc::hal::gpio::{Input, PinDriver};
+use esp_idf_svc::hal::modem::WifiModemPeripheral;
+use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::sys::*;
+use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
 const BG: Rgb565 = Rgb565::new(1, 4, 2);
 const ORANGE: Rgb565 = Rgb565::new(31, 35, 0);
@@ -39,8 +33,6 @@ static N_DATA: AtomicU32 = AtomicU32::new(0);
 static N_EAPOL: AtomicU32 = AtomicU32::new(0);
 static MSG_SEEN: AtomicU32 = AtomicU32::new(0);
 
-/// Trames 802.11 brutes des EAPOL capturés (pour export .pcap sur SD). Rempli
-/// par le callback rx, vidé/écrit par `run` à la sortie. Borné pour la RAM.
 static CAPTURED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 const MAX_CAPTURED: usize = 200;
 
@@ -59,26 +51,14 @@ unsafe extern "C" fn rx_cb(buf: *mut c_void, pkt_type: u32) {
     let len = (*pkt).rx_ctrl.sig_len() as usize;
     let payload = (*pkt).payload.as_ptr();
 
-    // DIAG : logge tout 88 8E avec les octets suivants (sans filtre strict).
     let mut i = 0usize;
     while i + 8 < len {
-        if *payload.add(i) == 0x88 && *payload.add(i + 1) == 0x8E {
-            info!(
-                "HIT off={} : {:02X} {:02X} {:02X} {:02X}",
-                i,
-                *payload.add(i + 2),
-                *payload.add(i + 3),
-                *payload.add(i + 4),
-                *payload.add(i + 5)
-            );
-        }
         if *payload.add(i) == 0x88
             && *payload.add(i + 1) == 0x8E
             && (*payload.add(i + 2) == 0x01 || *payload.add(i + 2) == 0x02)
             && *payload.add(i + 3) == 0x03
         {
             N_EAPOL.fetch_add(1, Ordering::Relaxed);
-            // ethertype a i,i+1 ; eapol a i+2 ; Key Information a i+7.
             let ki = ((*payload.add(i + 7) as u16) << 8) | (*payload.add(i + 8) as u16);
             let install = ki & 0x0040 != 0;
             let ack = ki & 0x0080 != 0;
@@ -99,7 +79,6 @@ unsafe extern "C" fn rx_cb(buf: *mut c_void, pkt_type: u32) {
                 MSG_SEEN.fetch_or(bit, Ordering::Relaxed);
                 info!("EAPOL M{} ki={:04X}", label, ki);
             }
-            // Capture la trame 802.11 brute pour l'export .pcap (bornée).
             if let Ok(mut g) = CAPTURED.lock() {
                 if g.len() < MAX_CAPTURED {
                     let mut frame = Vec::with_capacity(len);
@@ -109,11 +88,6 @@ unsafe extern "C" fn rx_cb(buf: *mut c_void, pkt_type: u32) {
                     g.push(frame);
                 }
             }
-            let mut s = String::with_capacity(len * 2);
-            for k in 0..len {
-                s.push_str(&format!("{:02X}", *payload.add(k)));
-            }
-            info!("PCAP:{}", s);
             return;
         }
         i += 1;
@@ -125,69 +99,91 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+    display.clear(BG).map_err(crate::anyhow_dbg)?;
     Rectangle::new(Point::new(0, 0), Size::new(240, 30))
         .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-    Text::new(title, Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
-        .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(crate::anyhow_dbg)?;
+    Text::new(
+        title,
+        Point::new(8, 19),
+        MonoTextStyle::new(&FONT_6X10, ORANGE),
+    )
+    .draw(display)
+    .map_err(crate::anyhow_dbg)?;
     Text::new(l1, Point::new(8, 60), MonoTextStyle::new(&FONT_6X10, WHITE))
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(crate::anyhow_dbg)?;
     Text::new(l2, Point::new(8, 80), MonoTextStyle::new(&FONT_6X10, WHITE))
         .draw(display)
-        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        .map_err(crate::anyhow_dbg)?;
     Ok(())
 }
 
-/// Vide [`CAPTURED`] et écrit les trames EAPOL dans un `.pcap` (DLT 105,
-/// IEEE 802.11) sur `/sdcard/loot/handshakes/`. Renvoie le chemin, ou `None`
-/// si rien n'a été capturé. Le fichier est lisible par Wireshark / aircrack-ng.
+fn storage_root() -> &'static str {
+    if std::fs::metadata("/sdcard").is_ok() {
+        "/sdcard"
+    } else {
+        "/spiflash"
+    }
+}
+
 fn save_handshakes_pcap(ssid: &str) -> anyhow::Result<Option<String>> {
     use std::io::Write;
     let frames = {
-        let mut g = CAPTURED.lock().map_err(|_| anyhow::anyhow!("CAPTURED lock"))?;
+        let mut g = CAPTURED
+            .lock()
+            .map_err(|_| anyhow::anyhow!("CAPTURED lock"))?;
         std::mem::take(&mut *g)
     };
     if frames.is_empty() {
         return Ok(None);
     }
-    std::fs::create_dir_all("/sdcard/loot/handshakes")?;
+
+    let root = storage_root();
+    let dir = format!("{}/loot/handshakes", root);
+    std::fs::create_dir_all(&dir)?;
     let safe: String = ssid
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .take(20)
         .collect();
-    let name = if safe.is_empty() { "cap".to_string() } else { safe };
+    let name = if safe.is_empty() {
+        "cap".to_string()
+    } else {
+        safe
+    };
     static SEQ: AtomicU32 = AtomicU32::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = format!("/sdcard/loot/handshakes/{}-{}.pcap", name, n);
+    let path = format!("{}/{}-{}.pcap", dir, name, n);
 
-    let mut f = std::fs::File::create(&path)?;
-    // En-tête global pcap (little-endian), network = 105 (LINKTYPE_IEEE802_11).
-    f.write_all(&0xa1b2c3d4u32.to_le_bytes())?; // magic
-    f.write_all(&2u16.to_le_bytes())?; // version major
-    f.write_all(&4u16.to_le_bytes())?; // version minor
-    f.write_all(&0i32.to_le_bytes())?; // thiszone
-    f.write_all(&0u32.to_le_bytes())?; // sigfigs
-    f.write_all(&65535u32.to_le_bytes())?; // snaplen
-    f.write_all(&105u32.to_le_bytes())?; // network (802.11)
+    let mut f =
+        std::fs::File::create(&path).map_err(|e| anyhow::anyhow!("PCAP create {}: {}", path, e))?;
+    f.write_all(&0xa1b2c3d4u32.to_le_bytes())?;
+    f.write_all(&2u16.to_le_bytes())?;
+    f.write_all(&4u16.to_le_bytes())?;
+    f.write_all(&0i32.to_le_bytes())?;
+    f.write_all(&0u32.to_le_bytes())?;
+    f.write_all(&65535u32.to_le_bytes())?;
+    f.write_all(&105u32.to_le_bytes())?;
     for (i, fr) in frames.iter().enumerate() {
-        f.write_all(&(i as u32).to_le_bytes())?; // ts_sec (pas de RTC → index)
-        f.write_all(&0u32.to_le_bytes())?; // ts_usec
-        f.write_all(&(fr.len() as u32).to_le_bytes())?; // incl_len
-        f.write_all(&(fr.len() as u32).to_le_bytes())?; // orig_len
+        f.write_all(&(i as u32).to_le_bytes())?;
+        f.write_all(&0u32.to_le_bytes())?;
+        f.write_all(&(fr.len() as u32).to_le_bytes())?;
+        f.write_all(&(fr.len() as u32).to_le_bytes())?;
         f.write_all(fr)?;
     }
     f.flush()?;
+    info!("PCAP: {} ({} trames)", path, frames.len());
     Ok(Some(path))
 }
 
-/// Passe en promiscuous sur le `channel` de la cible et affiche l'avancement de
-/// la capture du 4-way handshake. `target_ssid`/`channel` viennent du picker
-/// ([`super::scan::pick`]). `back` coupe la capture et rend le modem.
 #[allow(clippy::too_many_arguments)]
 pub fn run<D>(
     modem: impl WifiModemPeripheral,
@@ -202,9 +198,7 @@ where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
 {
-    info!("=== Sniffer 802.11 / capture handshake — cible {} canal {} ===", target_ssid, channel);
-
-    // Remet les compteurs + le buffer de capture à zéro (statiques réutilisés).
+    info!("Sniff WPA: {} ch {}", target_ssid, channel);
     for c in [&N_TOTAL, &N_MGMT, &N_DATA, &N_EAPOL, &MSG_SEEN] {
         c.store(0, Ordering::Relaxed);
     }
@@ -216,82 +210,93 @@ where
     wifi.set_configuration(&Configuration::Client(ClientConfiguration::default()))?;
     wifi.start()?;
 
-    let canal = channel;
-    let l1 = format!("Cible : {:.18}", target_ssid);
-    let l2 = format!("Canal : {}", canal);
-    banner(display, "Capture handshake", &l1, &l2)?;
+    banner(
+        display,
+        "Capture handshake",
+        &format!("Cible: {:.18}", target_ssid),
+        &format!("Canal: {}", channel),
+    )?;
     FreeRtos::delay_ms(1500);
 
     unsafe {
         esp_wifi_set_promiscuous(true);
         esp_wifi_set_promiscuous_rx_cb(Some(rx_cb));
-        esp_wifi_set_channel(canal, wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
+        esp_wifi_set_channel(channel, wifi_second_chan_t_WIFI_SECOND_CHAN_NONE);
     }
-    info!("Promiscuous actif sur le canal {}", canal);
 
     let style = MonoTextStyle::new(&FONT_6X10, WHITE);
+    let saved = false;
     loop {
         if back.is_low() {
-            // Cleanup : couper le promiscuous avant de rendre le modem.
             unsafe {
                 esp_wifi_set_promiscuous_rx_cb(None);
                 esp_wifi_set_promiscuous(false);
             }
-            // Sauve les EAPOL capturés en .pcap sur SD (lisible aircrack/Wireshark).
-            match save_handshakes_pcap(target_ssid) {
-                Ok(Some(path)) => {
-                    info!("Handshakes sauvés : {}", path);
-                    banner(display, "Capture handshake", "Sauve sur SD :", &path)?;
-                    FreeRtos::delay_ms(2000);
+            if !saved {
+                match save_handshakes_pcap(target_ssid) {
+                    Ok(Some(path)) => {
+                        banner(display, "Capture handshake", "PCAP sauvé:", &path)?;
+                        FreeRtos::delay_ms(3000);
+                    }
+                    Ok(None) => info!("Aucun EAPOL"),
+                    Err(e) => ::log::warn!("PCAP KO: {:?}", e),
                 }
-                Ok(None) => info!("Aucun EAPOL capturé — rien à sauver"),
-                Err(e) => ::log::warn!("Sauvegarde .pcap KO: {:?}", e),
             }
             return Ok(());
         }
-
         let total = N_TOTAL.load(Ordering::Relaxed);
-        let mgmt = N_MGMT.load(Ordering::Relaxed);
         let data = N_DATA.load(Ordering::Relaxed);
         let eapol = N_EAPOL.load(Ordering::Relaxed);
         let seen = MSG_SEEN.load(Ordering::Relaxed);
 
-        display.clear(BG).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+        display.clear(BG).map_err(crate::anyhow_dbg)?;
         Rectangle::new(Point::new(0, 0), Size::new(240, 30))
             .into_styled(PrimitiveStyleBuilder::new().fill_color(GRAY).build())
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Text::new("Capture handshake", Point::new(8, 19), MonoTextStyle::new(&FONT_6X10, ORANGE))
+            .map_err(crate::anyhow_dbg)?;
+        Text::new(
+            "Capture handshake",
+            Point::new(8, 19),
+            MonoTextStyle::new(&FONT_6X10, ORANGE),
+        )
+        .draw(display)
+        .map_err(crate::anyhow_dbg)?;
+        Text::new(
+            &format!("Canal:{} Trames:{}", channel, total),
+            Point::new(8, 52),
+            style,
+        )
+        .draw(display)
+        .map_err(crate::anyhow_dbg)?;
+        Text::new(
+            &format!("Data:{} EAPOL:{}", data, eapol),
+            Point::new(8, 69),
+            style,
+        )
+        .draw(display)
+        .map_err(crate::anyhow_dbg)?;
+        Text::new("Handshake:", Point::new(8, 100), style)
             .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
-        let l1 = format!("Canal     : {}", canal);
-        let l2 = format!("Trames    : {}", total);
-        let l3 = format!("Management: {}", mgmt);
-        let l4 = format!("Data      : {}   EAPOL : {}", data, eapol);
-        Text::new(&l1, Point::new(8, 52), style).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Text::new(&l2, Point::new(8, 69), style).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Text::new(&l3, Point::new(8, 86), style).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-        Text::new(&l4, Point::new(8, 103), style).draw(display).map_err(|e| anyhow::anyhow!("{:?}", e))?;
-
-        Text::new("Handshake :", Point::new(8, 130), style)
-            .draw(display)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(crate::anyhow_dbg)?;
         for m in 0..4u32 {
             let vu = (seen & (1 << m)) != 0;
-            let col = if vu { GREEN } else { GRAY };
-            let label = format!("M{}", m + 1);
-            Text::new(&label, Point::new(100 + (m as i32) * 32, 130), MonoTextStyle::new(&FONT_6X10, col))
-                .draw(display)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::new(
+                &format!("M{}", m + 1),
+                Point::new(100 + (m as i32) * 32, 100),
+                MonoTextStyle::new(&FONT_6X10, if vu { GREEN } else { GRAY }),
+            )
+            .draw(display)
+            .map_err(crate::anyhow_dbg)?;
         }
-
         if seen == 0x0F {
-            Text::new("HANDSHAKE COMPLET 4/4 !", Point::new(8, 160), MonoTextStyle::new(&FONT_6X10, GREEN))
-                .draw(display)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            Text::new(
+                "HANDSHAKE 4/4!",
+                Point::new(8, 130),
+                MonoTextStyle::new(&FONT_6X10, GREEN),
+            )
+            .draw(display)
+            .map_err(crate::anyhow_dbg)?;
         }
-
         FreeRtos::delay_ms(300);
     }
 }

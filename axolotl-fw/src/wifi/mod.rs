@@ -1,22 +1,9 @@
 //! WiFi AP + serveur HTTP pour le file browser SD.
 //!
 //! Réseau : SSID=AxolotlZero  pass=axolotl1  IP=192.168.71.1
-//!
-//! Routes HTTP :
-//!   GET  /              → interface web embarquée (index.html)
-//!   GET  /api/status    → {"sd":true/false}
-//!   GET  /api/files?dir=dumps|dicts → [{n:"nom",s:taille},...]
-//!   GET  /file?path=... → téléchargement fichier
-//!   POST /file?path=... → upload fichier
-//!
-//! Sous-modules d'attaque (portés depuis `feature/wifi_attacks`) :
-//!   - [`scan`]     : scan des réseaux 2.4 GHz
-//!   - [`sniff`]    : capture / deauth
-//!   - [`captive_dns`] + [`eviltwin`] : AP evil-twin + portail captif
 
 pub mod captive_dns;
 pub mod eviltwin;
-pub mod portals;
 pub mod scan;
 pub mod sniff;
 
@@ -40,9 +27,6 @@ pub struct WebServer<'d> {
 }
 
 impl<'d> WebServer<'d> {
-    /// Démarre l'AP + serveur HTTP. `modem` est **emprunté** (`impl Peripheral`)
-    /// pour être relâché à la destruction de `WebServer` — permet un usage à la
-    /// demande depuis le menu (le modem repart aux autres outils Wi-Fi).
     pub fn start(
         modem: impl esp_idf_svc::hal::modem::WifiModemPeripheral + 'd,
         sysloop: EspSystemEventLoop,
@@ -76,7 +60,7 @@ impl<'d> WebServer<'d> {
             ..Default::default()
         })?;
 
-        // GET / → page HTML embarquée
+        // GET / → page HTML embarquée (file browser)
         http.fn_handler("/", Method::Get, |req| {
             req.into_response(
                 200,
@@ -84,25 +68,22 @@ impl<'d> WebServer<'d> {
                 &[("Content-Type", "text/html; charset=utf-8")],
             )?
             .write(INDEX_HTML)
-            .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+            .map_err(crate::anyhow_dbg)?;
             Ok::<(), anyhow::Error>(())
         })?;
 
         // GET /api/status
         http.fn_handler("/api/status", Method::Get, |req| {
             let sd_ok = std::fs::metadata("/sdcard").is_ok();
-            let body: &[u8] = if sd_ok {
-                b"{\"sd\":true}"
-            } else {
-                b"{\"sd\":false}"
-            };
+            let spiflash_ok = std::fs::metadata("/spiflash").is_ok();
+            let body = format!(r#"{{"sd":{},"spiflash":{}}}"#, sd_ok, spiflash_ok);
             req.into_response(200, Some("OK"), &[("Content-Type", "application/json")])?
-                .write(body)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .write(body.as_bytes())
+                .map_err(crate::anyhow_dbg)?;
             Ok::<(), anyhow::Error>(())
         })?;
 
-        // GET /api/files?path=<dossier> → liste n'importe quel dossier (défaut /sdcard)
+        // GET /api/files?path=<dossier> → liste n'importe quel dossier
         http.fn_handler("/api/files", Method::Get, |req| {
             let mut dir = url_param(req.uri(), "path");
             if dir.is_empty() {
@@ -111,18 +92,22 @@ impl<'d> WebServer<'d> {
             let json = list_dir_json(&dir);
             req.into_response(200, Some("OK"), &[("Content-Type", "application/json")])?
                 .write(json.as_bytes())
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .map_err(crate::anyhow_dbg)?;
             Ok::<(), anyhow::Error>(())
         })?;
 
-        // GET /api/rm?path=... → supprime un fichier
+        // GET /api/rm?path=...
         http.fn_handler("/api/rm", Method::Get, |req| {
             let path = url_param(req.uri(), "path");
             let ok = !path.is_empty() && std::fs::remove_file(&path).is_ok();
-            let body: &[u8] = if ok { b"{\"ok\":true}" } else { b"{\"ok\":false}" };
+            let body: &[u8] = if ok {
+                b"{\"ok\":true}"
+            } else {
+                b"{\"ok\":false}"
+            };
             req.into_response(200, Some("OK"), &[("Content-Type", "application/json")])?
                 .write(body)
-                .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                .map_err(crate::anyhow_dbg)?;
             Ok::<(), anyhow::Error>(())
         })?;
 
@@ -131,17 +116,27 @@ impl<'d> WebServer<'d> {
             let path = url_param(req.uri(), "path");
             match std::fs::read(&path) {
                 Ok(data) => {
+                    // Nom de fichier explicite => le navigateur télécharge avec la
+                    // vraie extension (.pcap/.mfd/.csv…) au lieu de « file »/HTML.
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("download");
+                    let cd = format!("attachment; filename=\"{}\"", name);
                     let mut resp = req.into_response(
                         200,
                         Some("OK"),
-                        &[("Content-Disposition", "attachment")],
+                        &[
+                            ("Content-Disposition", cd.as_str()),
+                            ("Content-Type", "application/octet-stream"),
+                        ],
                     )?;
-                    write_all(&mut resp, &data).map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                    write_all(&mut resp, &data).map_err(crate::anyhow_dbg)?;
                 }
                 Err(_) => {
                     req.into_response(404, Some("Not Found"), &[])?
                         .write(b"not found")
-                        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                        .map_err(crate::anyhow_dbg)?;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -153,10 +148,9 @@ impl<'d> WebServer<'d> {
             if path.is_empty() {
                 req.into_response(400, Some("Bad Request"), &[])?
                     .write(b"missing path")
-                    .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                    .map_err(crate::anyhow_dbg)?;
                 return Ok(());
             }
-            // Lecture du corps par chunks
             let mut body: Vec<u8> = Vec::new();
             let mut buf = [0u8; 512];
             loop {
@@ -165,7 +159,6 @@ impl<'d> WebServer<'d> {
                     Ok(n) => body.extend_from_slice(&buf[..n]),
                 }
             }
-            // Crée le répertoire parent si nécessaire
             if let Some(p) = std::path::Path::new(&path).parent() {
                 let _ = std::fs::create_dir_all(p);
             }
@@ -173,13 +166,13 @@ impl<'d> WebServer<'d> {
                 Ok(_) => {
                     req.into_response(200, Some("OK"), &[])?
                         .write(b"ok")
-                        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                        .map_err(crate::anyhow_dbg)?;
                 }
                 Err(e) => {
                     let msg = format!("error: {e}");
                     req.into_response(500, Some("Error"), &[])?
                         .write(msg.as_bytes())
-                        .map_err(|e| anyhow::anyhow!("{:?}", e))?;
+                        .map_err(crate::anyhow_dbg)?;
                 }
             }
             Ok::<(), anyhow::Error>(())
@@ -192,10 +185,6 @@ impl<'d> WebServer<'d> {
     }
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
-/// Liste un répertoire en JSON : [{n:"nom",s:taille,d:true/false},...]
-/// `d`=true pour un dossier. Trié (dossiers puis fichiers via préfixe de tri).
 fn list_dir_json(path: &str) -> String {
     let Ok(rd) = std::fs::read_dir(path) else {
         return "[]".to_string();
@@ -206,9 +195,11 @@ fn list_dir_json(path: &str) -> String {
             let name = e.file_name().to_string_lossy().replace('"', "\\\"");
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
             let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-            // clé de tri : dossiers d'abord (0), puis fichiers (1), par nom.
             let key = format!("{}{}", if is_dir { '0' } else { '1' }, name);
-            (key, format!("{{\"n\":\"{name}\",\"s\":{size},\"d\":{is_dir}}}"))
+            (
+                key,
+                format!("{{\"n\":\"{name}\",\"s\":{size},\"d\":{is_dir}}}"),
+            )
         })
         .collect();
     items.sort_by(|a, b| a.0.cmp(&b.0));
@@ -216,7 +207,6 @@ fn list_dir_json(path: &str) -> String {
     format!("[{}]", json.join(","))
 }
 
-/// Extrait un paramètre de query-string depuis une URI.
 fn url_param(uri: &str, key: &str) -> String {
     let needle = format!("?{key}=");
     let alt = format!("&{key}=");
@@ -234,7 +224,6 @@ fn url_param(uri: &str, key: &str) -> String {
     pct_decode(raw)
 }
 
-/// Décode le percent-encoding (%XX) d'une URL.
 fn pct_decode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let b = s.as_bytes();
@@ -262,7 +251,6 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Écrit `data` en entier dans `w`, gère les écritures partielles.
 fn write_all<W: embedded_svc::io::Write>(w: &mut W, data: &[u8]) -> Result<(), W::Error> {
     let mut off = 0;
     while off < data.len() {

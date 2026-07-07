@@ -3,100 +3,316 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Axolotl Zero — SD</title>
+<title>Axolotl Zero — Control Center</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;background:#0a1410;color:#eee;font-family:system-ui,'Segoe UI',sans-serif}
-header{background:#111e18;padding:14px 16px;position:sticky;top:0}
-h1{margin:0;color:#ff8c00;font-size:20px;letter-spacing:1px}
-.path{color:#9fd;font-size:13px;margin-top:6px;word-break:break-all}
-.wrap{max-width:820px;margin:0 auto;padding:12px 16px}
-.row{display:flex;align-items:center;gap:10px;padding:10px;border-bottom:1px solid #1a2e24}
-.row a{color:#eee;text-decoration:none;flex:1;word-break:break-all}
-.dir a{color:#ff8c00;font-weight:600}
-.sz{color:#567;font-size:12px;white-space:nowrap}
-.btn{background:#1a2e24;color:#9fd;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:13px;text-decoration:none}
-.btn:hover{background:#26463a}
-.del{color:#ff6b6b}
-.up{margin:10px 0;display:inline-block}
-form{margin:16px 0;padding:14px;background:#111e18;border-radius:10px}
-input[type=file]{color:#9fd}
-button.upload{background:linear-gradient(135deg,#ff8c00,#e67600);color:#0a1410;border:none;border-radius:8px;padding:10px 16px;font-weight:700;cursor:pointer;margin-top:8px}
-.empty{color:#567;padding:20px;text-align:center}
+:root{
+  --bg:#0a0a0a;--bg2:#0f0f0f;--panel:#0d0d0d;--panel2:#141414;--panel3:#1c1c1c;
+  --border:#1e1e1e;--borderHot:#2d2d2d;
+  --orange:#ff7a1a;--orangeHot:#ffa04d;--orangeDeep:#a34d00;
+  --cyan:#c9c3ba;--cyan2:#7d7873;--text:#e6e6e6;--muted:#5f5f5f;
+  --danger:#ff4d4d;--success:#3fb950;
+  --glow-o:0 0 0 1px rgba(255,122,26,.30);--glow-c:none;
+  --font:'Cascadia Code','JetBrains Mono','Fira Code','Consolas',ui-monospace,monospace;
+  --mono:'Cascadia Code','JetBrains Mono','Fira Code','Consolas',ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:linear-gradient(180deg,rgba(255,122,26,.03),transparent 200px),var(--bg);
+  color:var(--text);font-family:var(--font);min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--borderHot);border-radius:0}
+
+header{
+  position:sticky;top:0;z-index:20;
+  background:rgba(10,10,10,.96);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-top:2px solid var(--orange);border-bottom:1px solid var(--border);
+}
+.header-inner{max-width:1400px;margin:0 auto;padding:10px 16px;display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{width:34px;height:34px;border-radius:3px;background:var(--panel2);border:1px solid var(--orangeDeep);display:grid;place-items:center;font-size:18px}
+h1{font-family:var(--mono);font-weight:700;font-size:15px;letter-spacing:.18em;text-transform:uppercase}
+h1 span{color:var(--orange)}
+.sub{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:.24em;text-transform:uppercase}
+.status{display:flex;align-items:center;gap:6px;padding:5px 10px;background:var(--panel);border:1px solid var(--border);border-radius:3px;font-family:var(--mono);font-size:10px;color:var(--cyan);letter-spacing:.1em;text-transform:uppercase}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 6px var(--success);animation:pulse 2.4s infinite}
+.dot.off{background:var(--danger);box-shadow:0 0 6px var(--danger)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+nav.tabs{display:flex;gap:2px;margin-left:auto;flex-wrap:wrap}
+.tab{padding:6px 13px;background:transparent;border:1px solid transparent;border-radius:3px;cursor:pointer;font-family:var(--mono);font-size:11px;font-weight:600;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;transition:color .12s,border-color .12s,background .12s}
+.tab:hover{color:var(--text)}
+.tab.active{background:var(--panel2);border:1px solid var(--borderHot);border-bottom:2px solid var(--orange);color:var(--orange)}
+
+.wrap{max-width:1400px;margin:0 auto;padding:20px 16px 60px}
+.view{display:none}
+.view.active{display:block;animation:fade .18s ease}
+@keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+
+.section-title{display:flex;align-items:center;gap:8px;margin:4px 0 12px;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.22em;text-transform:uppercase;color:var(--orange)}
+.section-title::before{content:"";width:14px;height:2px;background:var(--orange)}
+.section-title .count{margin-left:auto;color:var(--muted);font-weight:500;letter-spacing:.1em}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:22px}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:14px 16px;position:relative;overflow:hidden;transition:border-color .15s}
+.stat:hover{border-color:var(--borderHot)}
+.stat::before{content:"";position:absolute;top:0;left:0;bottom:0;width:2px;background:var(--border)}
+.stat.o::before{background:var(--orange)}
+.stat .label{font-family:var(--mono);font-size:9px;color:var(--muted);letter-spacing:.2em;text-transform:uppercase;margin-bottom:5px}
+.stat .val{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--text);line-height:1}
+.stat .val small{font-size:11px;color:var(--muted);font-weight:500;margin-left:3px}
+.stat.o .val{color:var(--orange)}
+.stat.c .val{color:var(--cyan)}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:4px;overflow:hidden}
+.card-head{padding:11px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;background:var(--panel2)}
+.card-head h3{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--text)}
+.card-head .badge{margin-left:auto;font-family:var(--mono);font-size:9px;color:var(--muted);padding:2px 8px;border-radius:3px;background:var(--bg2);border:1px solid var(--border);letter-spacing:.1em;text-transform:uppercase}
+.card-body{padding:0}
+.card-body.p{padding:12px 16px}
+.card-body.scroll{max-height:320px;overflow-y:auto}
+.empty{color:var(--muted);padding:32px 16px;text-align:center;font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase}
+
+.row{display:flex;align-items:center;gap:10px;padding:10px 16px;border-bottom:1px solid var(--border);transition:background .1s}
+.row:last-child{border:none}
+.row:hover{background:var(--panel2)}
+.icn{width:28px;height:28px;flex-shrink:0;border-radius:3px;display:grid;place-items:center;background:var(--bg2);border:1px solid var(--border);font-size:13px;color:var(--muted)}
+.row.dir .icn{color:var(--orange);background:var(--panel2);border-color:var(--orangeDeep)}
+.name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:var(--text);text-decoration:none;cursor:pointer}
+.row.dir .name{color:var(--orangeHot);font-weight:600}
+.meta{font-family:var(--mono);font-size:10px;color:var(--muted);white-space:nowrap;letter-spacing:.04em}
+.actions{display:flex;gap:4px}
+
+.btn{background:var(--panel2);color:var(--text);border:1px solid var(--borderHot);border-radius:3px;padding:6px 10px;cursor:pointer;font-size:11px;font-weight:500;text-decoration:none;display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);transition:color .12s,border-color .12s,background .12s;white-space:nowrap}
+.btn:hover{background:var(--panel3);color:var(--orangeHot);border-color:var(--orangeDeep)}
+.btn.icon{padding:5px 7px;font-size:11px}
+.btn.ghost{background:transparent;border-color:var(--border)}
+.btn.del:hover{color:var(--danger);border-color:#5a1a1a;background:#1e0d0d}
+.btn.primary{background:var(--orange);color:#0a0a0a;border-color:var(--orange);font-weight:700}
+.btn.primary:hover{background:var(--orangeHot);border-color:var(--orangeHot);color:#0a0a0a}
+.btn.cyan{background:transparent;border-color:var(--cyan2);color:var(--cyan)}
+.btn.cyan:hover{background:var(--panel3);color:var(--text)}
+
+.explorer-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.mount-switch{display:flex;background:var(--panel);border:1px solid var(--border);border-radius:3px;padding:2px;gap:2px}
+.mount-switch button{background:transparent;border:none;padding:6px 13px;border-radius:2px;cursor:pointer;font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.14em;text-transform:uppercase;font-weight:700;transition:color .12s,background .12s}
+.mount-switch button:hover{color:var(--text)}
+.mount-switch button.active{background:var(--orange);color:#0a0a0a}
+.breadcrumb{flex:1;min-width:180px;display:flex;align-items:center;gap:3px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--border);border-left:2px solid var(--orange);padding:7px 12px;border-radius:3px;font-family:var(--mono);font-size:11px}
+.breadcrumb a{color:var(--orangeHot);text-decoration:none;cursor:pointer}
+.breadcrumb a:hover{color:var(--orange);text-decoration:underline}
+.breadcrumb .sep{color:var(--muted)}
+.breadcrumb .cur{color:var(--cyan)}
+
+.dropzone{margin-top:14px;padding:20px;background:var(--panel);border:1px dashed var(--borderHot);border-radius:4px;text-align:center;transition:border-color .15s,background .15s}
+.dropzone.hover{border-color:var(--orange);background:rgba(255,122,26,.05)}
+.dropzone .up-icon{font-size:22px;margin-bottom:6px;color:var(--orange)}
+.dropzone .up-title{font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--orange);font-weight:700;margin-bottom:3px}
+.dropzone .up-sub{font-size:11px;color:var(--muted);margin-bottom:10px}
+.dropzone input[type=file]{display:none}
+
+.modal-bg{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.86);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);display:none;align-items:center;justify-content:center;padding:16px}
+.modal-bg.open{display:flex}
+.modal{background:var(--panel);border:1px solid var(--borderHot);border-top:2px solid var(--orange);border-radius:4px;max-width:850px;width:100%;max-height:82vh;display:flex;flex-direction:column;box-shadow:0 16px 48px rgba(0,0,0,.7)}
+.modal-head{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
+.modal-head h3{font-family:var(--mono);font-size:11px;letter-spacing:.12em;color:var(--orange);font-weight:700;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modal-body{flex:1;overflow:auto;padding:14px 16px}
+.modal-body pre{font-family:var(--mono);font-size:11px;color:var(--cyan);white-space:pre-wrap;word-break:break-all;line-height:1.5;tab-size:2}
+.modal-body table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+.modal-body th{text-align:left;padding:7px 9px;background:var(--panel2);color:var(--orange);font-weight:700;letter-spacing:.08em;border-bottom:1px solid var(--borderHot);position:sticky;top:0}
+.modal-body td{padding:6px 9px;color:var(--text);border-bottom:1px solid var(--border)}
+.modal-body tr:hover td{background:var(--panel2)}
+
+.toast-stack{position:fixed;bottom:16px;right:16px;z-index:200;display:flex;flex-direction:column;gap:6px}
+.toast{background:var(--panel);border:1px solid var(--borderHot);border-left:2px solid var(--orange);padding:10px 14px;border-radius:3px;font-family:var(--mono);font-size:11px;color:var(--text);min-width:200px;animation:slidein .22s ease;box-shadow:0 4px 16px rgba(0,0,0,.5)}
+.toast.err{border-left-color:var(--danger)}
+.toast.ok{border-left-color:var(--success);color:var(--cyan)}
+@keyframes slidein{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:none}}
+
+.table-wrap{overflow-x:auto}
+table.data{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px}
+table.data th{text-align:left;padding:8px 12px;background:var(--panel2);color:var(--orange);font-weight:700;letter-spacing:.1em;text-transform:uppercase;font-size:9px;border-bottom:1px solid var(--borderHot)}
+table.data td{padding:8px 12px;color:var(--text);border-bottom:1px solid var(--border);word-break:break-all}
+table.data tr:hover td{background:var(--panel2)}
+
+@media(max-width:700px){.header-inner{gap:8px}nav.tabs{width:100%;order:5;margin:0;justify-content:center}.sub{display:none}.grid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
+
 <header>
-  <h1>📂 Axolotl Zero — carte SD</h1>
-  <div class="path" id="path">/sdcard</div>
+  <div class="header-inner">
+    <div class="brand">
+      <div class="logo">🦎</div>
+      <div><h1>Axolotl<span>.</span>Zero</h1><div class="sub">Control Center</div></div>
+    </div>
+    <div class="status"><div class="dot" id="statusDot"></div><span id="statusText">connecté</span></div>
+    <nav class="tabs">
+      <button class="tab active" data-view="dashboard">Dashboard</button>
+      <button class="tab" data-view="explorer">Fichiers</button>
+      <button class="tab" data-view="handshakes">Handshakes</button>
+      <button class="tab" data-view="creds">Creds</button>
+      <button class="tab" data-view="nfc">NFC</button>
+    </nav>
+  </div>
 </header>
+
 <div class="wrap">
-  <a class="btn up" id="up" href="#">⬆ dossier parent</a>
-  <div id="list"><div class="empty">chargement…</div></div>
-  <form id="upform">
-    <div><b>Envoyer un fichier ici :</b></div>
-    <input type="file" id="file">
-    <div><button type="submit" class="upload">Uploader dans ce dossier</button></div>
-  </form>
+
+  <!-- DASHBOARD -->
+  <section class="view active" id="view-dashboard">
+    <div class="stats">
+      <div class="stat o"><div class="label">Handshakes</div><div class="val" id="stat-hs">–</div></div>
+      <div class="stat c"><div class="label">Credentials</div><div class="val" id="stat-cr">–</div></div>
+      <div class="stat o"><div class="label">Dumps NFC</div><div class="val" id="stat-nfc">–</div></div>
+      <div class="stat c"><div class="label">Fichiers</div><div class="val" id="stat-all">–</div></div>
+      <div class="stat"><div class="label">Volume</div><div class="val" id="stat-size">–<small>o</small></div></div>
+      <div class="stat"><div class="label">Session</div><div class="val" id="stat-up">0<small>s</small></div></div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="card-head"><h3>⚡ Handshakes WPA</h3><span class="badge" id="badge-hs">0</span></div><div class="card-body scroll" id="list-hs"></div></div>
+      <div class="card"><div class="card-head"><h3>▣ Dumps NFC</h3><span class="badge" id="badge-nfc">0</span></div><div class="card-body scroll" id="list-nfc"></div></div>
+      <div class="card" style="grid-column:1/-1"><div class="card-head"><h3>◐ Activité récente</h3><span class="badge">auto-refresh 5s</span></div><div class="card-body scroll" id="list-recent"></div></div>
+      <div class="card" style="grid-column:1/-1"><div class="card-head"><h3>◆ Credentials</h3><span class="badge" id="badge-cr">0</span></div><div class="card-body" id="creds-body"></div></div>
+    </div>
+  </section>
+
+  <!-- EXPLORER -->
+  <section class="view" id="view-explorer">
+    <div class="section-title">▸ Explorateur <span class="count" id="expCount">0</span></div>
+    <div class="explorer-head">
+      <div class="mount-switch" id="mountSwitch">
+        <button class="active" data-mount="/sdcard">SDCARD</button>
+        <button data-mount="/spiflash">SPIFLASH</button>
+      </div>
+      <div class="breadcrumb" id="breadcrumb"></div>
+      <button class="btn ghost" onclick="loadPath(cur)">↻</button>
+    </div>
+    <div class="card"><div class="card-body" id="explorerList"></div></div>
+    <div class="dropzone" id="dropzone">
+      <div class="up-icon">↥</div><div class="up-title">Déposer des fichiers</div>
+      <div class="up-sub">dossier : <span id="dz-path" style="color:var(--cyan)">/sdcard</span></div>
+      <input type="file" id="fileInput" multiple>
+      <button class="btn primary" onclick="document.getElementById('fileInput').click()">Parcourir</button>
+    </div>
+  </section>
+
+  <!-- HANDSHAKES / CREDS / NFC (simple list) -->
+  <section class="view" id="view-handshakes"><div class="section-title">⚡ Handshakes <span class="count" id="hs-count">0</span></div><div class="card"><div class="card-body" id="hs-full"></div></div></section>
+  <section class="view" id="view-creds"><div class="section-title">◆ Credentials <span class="count" id="cr-count">0</span></div><div class="card"><div class="card-body" id="cr-full"></div></div></section>
+  <section class="view" id="view-nfc"><div class="section-title">▣ Dumps NFC <span class="count" id="nfc-count">0</span></div><div class="card"><div class="card-body" id="nfc-full"></div></div></section>
 </div>
+
+<!-- MODAL -->
+<div class="modal-bg" id="modal" onclick="if(event.target.id==='modal')closeModal()">
+  <div class="modal">
+    <div class="modal-head"><h3 id="modalTitle"></h3><a class="btn cyan" id="modalDl" href="#" download>⬇</a><button class="btn ghost" onclick="closeModal()">✕</button></div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
+<div class="toast-stack" id="toasts"></div>
+
 <script>
-var cur = "/sdcard";
+var cur="/sdcard",mount="/sdcard",startedAt=Date.now(),allIndex={files:[],byPath:{}},pollTimer=null;
+function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}
+function join(a,b){return(a.endsWith("/")?a.slice(0,-1):a)+"/"+b}
+function ext(n){var i=n.lastIndexOf(".");return i>0?n.slice(i+1).toLowerCase():""}
+function fmtSize(b){if(b<1024)return b+" o";if(b<1048576)return(b/1024).toFixed(1)+" Ko";return(b/1048576).toFixed(1)+" Mo"}
+function fileUrl(p){return"/file?path="+encodeURIComponent(p)}
+function iconFor(n){var e=ext(n);if(/pcap|cap/.test(e))return"⚡";if(/mfd|nfc/.test(e))return"▣";if(/csv|tsv/.test(e))return"▤";if(/txt|log|md/.test(e))return"▦";return"◦"}
+function isText(n){return/txt|log|md|csv|tsv|json|xml|yml|yaml|sh|py|js|c|cpp|h|conf|cfg|ini/.test(ext(n))}
+// Fichiers binaires qu'on sait afficher en hexdump lisible (dumps NFC, pcap, bin).
+function isHex(n){return/mfd|nfc|bin|dump|pcap|cap/.test(ext(n))}
+function hexdump(u8){var lim=Math.min(u8.length,65536),out="",i,j;for(i=0;i<lim;i+=16){var off=("0000000"+i.toString(16)).slice(-8).toUpperCase(),hex="",asc="";for(j=0;j<16;j++){if(i+j<lim){var v=u8[i+j];hex+=("0"+v.toString(16)).slice(-2).toUpperCase()+" ";asc+=(v>=32&&v<127)?String.fromCharCode(v):"."}else{hex+="   "}if(j===7)hex+=" "}out+=off+"  "+hex+" |"+asc+"|\n"}if(u8.length>lim)out+="\n… "+fmtSize(u8.length-lim)+" tronqués";return out}
 
-function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
-function join(a,b){return (a.endsWith("/")?a.slice(0,-1):a)+"/"+b;}
+function toast(m,t){var e=document.createElement("div");e.className="toast"+(t?" "+t:"");e.textContent=m;document.getElementById("toasts").appendChild(e);setTimeout(function(){e.style.opacity="0";e.style.transition="opacity .3s";setTimeout(function(){e.remove()},300)},2400)}
+function setStatus(o){var d=document.getElementById("statusDot"),t=document.getElementById("statusText");if(o){d.classList.remove("off");t.textContent="connecté"}else{d.classList.add("off");t.textContent="offline"}}
 
-function load(path){
-  cur = path;
-  document.getElementById("path").textContent = cur;
-  fetch("/api/files?path="+encodeURIComponent(cur))
-    .then(function(r){return r.json();})
-    .then(render)
-    .catch(function(){document.getElementById("list").innerHTML='<div class="empty">erreur de lecture</div>';});
+function api(p){return fetch("/api/files?path="+encodeURIComponent(p)).then(function(r){if(!r.ok)throw 0;return r.json()})}
+
+// Tabs
+document.querySelectorAll(".tab").forEach(function(b){b.onclick=function(){
+  document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("active")});
+  document.querySelectorAll(".view").forEach(function(v){v.classList.remove("active")});
+  b.classList.add("active");var v=b.dataset.view;
+  document.getElementById("view-"+v).classList.add("active");
+  if(v==="explorer")loadPath(cur);
+  else refreshIndex();
+}});
+
+// Mount switch
+document.querySelectorAll("#mountSwitch button").forEach(function(b){b.onclick=function(){
+  document.querySelectorAll("#mountSwitch button").forEach(function(x){x.classList.remove("active")});
+  b.classList.add("active");mount=b.dataset.mount;loadPath(mount);
+}});
+
+// Scan : tous les dossiers où le firmware écrit de la loot (creds, handshakes, dumps NFC) + racines.
+// /loot est scanné directement => creds.csv (eviltwin) remonte enfin dans le dashboard.
+var SCAN_DIRS=[
+  ["/sdcard","/sdcard"],["/spiflash","/spiflash"],
+  ["/sdcard/loot","/sdcard"],["/spiflash/loot","/spiflash"],
+  ["/sdcard/loot/handshakes","/sdcard"],["/spiflash/loot/handshakes","/spiflash"],
+  ["/sdcard/NFC/dumps","/sdcard"],["/spiflash/NFC/dumps","/spiflash"]
+];
+function scanDir(dir,mnt){return api(dir).then(function(items){return(items||[]).filter(function(i){return!i.d}).map(function(i){return{name:i.n,path:join(dir,i.n),size:+i.s||0,mtime:+i.t||0,mount:mnt}})}).catch(function(){return[]})}
+function scanAll(){
+  return Promise.all(SCAN_DIRS.map(function(d){return scanDir(d[0],d[1])})).then(function(r){
+    var a=[].concat.apply([],r),seen={};
+    a=a.filter(function(f){if(seen[f.path])return false;seen[f.path]=1;return true});
+    allIndex.files=a;allIndex.byPath={};a.forEach(function(f){allIndex.byPath[f.path]=f});
+    setStatus(true);renderDashboard();renderFullLists()
+  }).catch(function(){setStatus(false)})
+}
+function refreshIndex(){return scanAll()}
+
+function filterFiles(fn){return allIndex.files.filter(fn).sort(function(a,b){return b.mtime-a.mtime})}
+function renderRows(l,emptyMsg){if(!l||!l.length)return'<div class="empty">'+(emptyMsg||"vide")+'</div>';return l.map(function(f){var u=fileUrl(f.path),can=isText(f.name)||isHex(f.name),fq=f.path.replace(/\\/g,"\\\\").replace(/'/g,"\\'");return'<div class="row"><div class="icn">'+iconFor(f.name)+'</div><a class="name" title="'+esc(f.path)+'" '+(can?'onclick="preview(\''+fq+'\',\''+esc(f.name)+'\')"':'href="'+u+'" download')+'>'+esc(f.name)+'</a><div class="meta">'+fmtSize(f.size)+'</div><div class="actions">'+(can?'<button class="btn icon cyan" onclick="preview(\''+fq+'\',\''+esc(f.name)+'\')">👁</button>':'')+'<a class="btn icon" href="'+u+'" download>⬇</a><button class="btn icon del" onclick="del(\''+fq+'\')">✕</button></div></div>'}).join("")}
+
+function renderDashboard(){
+  var hs=filterFiles(function(f){return/pcap|cap/.test(ext(f.name))}),nfc=filterFiles(function(f){return/mfd|nfc/.test(ext(f.name))}),creds=allIndex.files.filter(function(f){return f.name.toLowerCase()==="creds.csv"}),total=allIndex.files.reduce(function(a,f){return a+f.size},0);
+  document.getElementById("stat-hs").textContent=hs.length;document.getElementById("stat-nfc").textContent=nfc.length;document.getElementById("stat-all").textContent=allIndex.files.length;document.getElementById("stat-size").innerHTML=fmtSize(total).replace(/ /,' <small>')+"</small>";
+  document.getElementById("badge-hs").textContent=hs.length;document.getElementById("badge-nfc").textContent=nfc.length;
+  document.getElementById("list-hs").innerHTML=renderRows(hs.slice(0,6),"aucun handshake");
+  document.getElementById("list-nfc").innerHTML=renderRows(nfc.slice(0,6),"aucun dump nfc");
+  document.getElementById("list-recent").innerHTML=renderRows(allIndex.files.slice().sort(function(a,b){return b.mtime-a.mtime}).slice(0,10),"aucun fichier");
+  if(creds.length){loadCredsTable(creds[0].path)}else{["stat-cr","badge-cr","cr-count"].forEach(function(id){var e=document.getElementById(id);if(e)e.textContent="0"});["creds-body","cr-full"].forEach(function(id){var e=document.getElementById(id);if(e)e.innerHTML='<div class="empty">aucun creds.csv</div>'})}
 }
 
-function render(items){
-  var el = document.getElementById("list");
-  if(!items || !items.length){ el.innerHTML='<div class="empty">(dossier vide)</div>'; return; }
-  var h = "";
-  items.forEach(function(it){
-    var full = join(cur, it.n);
-    var fq = full.replace(/'/g,"\\'");
-    if(it.d){
-      h += '<div class="row dir"><a href="#" onclick="load(\''+fq+'\');return false;">📁 '+esc(it.n)+'</a></div>';
-    } else {
-      h += '<div class="row"><a href="/file?path='+encodeURIComponent(full)+'" download>📄 '+esc(it.n)+'</a>'
-         + '<span class="sz">'+it.s+' o</span>'
-         + '<a class="btn" href="/file?path='+encodeURIComponent(full)+'" download>⬇</a>'
-         + '<button class="btn del" onclick="del(\''+fq+'\')">🗑</button></div>';
-    }
-  });
-  el.innerHTML = h;
+// Vues dédiées (onglets Handshakes / NFC) — les creds sont gérées par loadCredsTable (dashboard + onglet en une passe).
+function renderFullLists(){
+  var hs=filterFiles(function(f){return/pcap|cap/.test(ext(f.name))}),nfc=filterFiles(function(f){return/mfd|nfc/.test(ext(f.name))}),e;
+  if(e=document.getElementById("hs-full"))e.innerHTML=renderRows(hs,"aucun handshake");
+  if(e=document.getElementById("nfc-full"))e.innerHTML=renderRows(nfc,"aucun dump nfc");
+  if(e=document.getElementById("hs-count"))e.textContent=hs.length;
+  if(e=document.getElementById("nfc-count"))e.textContent=nfc.length;
 }
 
-function del(path){
-  if(!confirm("Supprimer "+path+" ?")) return;
-  fetch("/api/rm?path="+encodeURIComponent(path)).then(function(){load(cur);});
-}
+function parseCSV(t){var l=t.replace(/\r/g,"").split("\n").filter(function(x){return x.trim()}),out=[];l.forEach(function(r){var row=[],cur="",q=false;for(var i=0;i<r.length;i++){var c=r[i];if(c==='"'){q=!q;continue}if(c===","&&!q){row.push(cur);cur="";continue}cur+=c}row.push(cur);out.push(row)});return out}
+// Rend creds.csv dans le dashboard ET l'onglet Creds en une seule requête, met à jour les 3 compteurs.
+function loadCredsTable(p){var into=["creds-body","cr-full"],cnt=["stat-cr","badge-cr","cr-count"];function set(ids,v,html){ids.forEach(function(id){var e=document.getElementById(id);if(e){if(html)e.innerHTML=v;else e.textContent=v}})}fetch(fileUrl(p)).then(function(r){return r.text()}).then(function(t){var rows=parseCSV(t);if(!rows.length){set(cnt,"0",false);set(into,'<div class="empty">vide</div>',true);return}var h=rows[0],b=rows.slice(1);set(cnt,b.length,false);set(into,'<div class="table-wrap"><table class="data"><thead><tr>'+h.map(function(x){return"<th>"+esc(x)+"</th>"}).join("")+'</tr></thead><tbody>'+b.map(function(r){return"<tr>"+r.map(function(c){return"<td>"+esc(c)+"</td>"}).join("")+"</tr>"}).join("")+'</tbody></table></div>',true)}).catch(function(){set(into,'<div class="empty">erreur</div>',true)})}
 
-document.getElementById("up").onclick=function(e){
-  e.preventDefault();
-  if(cur.length<=1) return;
-  var p = cur.replace(/\/+$/,"");
-  var i = p.lastIndexOf("/");
-  load(i<=0 ? "/" : p.slice(0,i));
-};
+// Explorer
+function loadPath(p){cur=p;document.getElementById("dz-path").textContent=p;renderBreadcrumb(p);api(p).then(function(i){if(!i||!i.length){document.getElementById("explorerList").innerHTML='<div class="empty">dossier vide</div>';document.getElementById("expCount").textContent="0";return}i.sort(function(a,b){if(a.d!==b.d)return a.d?-1:1;return a.n.localeCompare(b.n)});document.getElementById("expCount").textContent=i.length+" items";document.getElementById("explorerList").innerHTML=i.map(function(it){var f=join(p,it.n),fq=f.replace(/\\/g,"\\\\").replace(/'/g,"\\'");if(it.d)return'<div class="row dir"><div class="icn">▸</div><a class="name" onclick="loadPath(\''+fq+'\')">'+esc(it.n)+'</a><div class="meta">dossier</div><div class="actions"><button class="btn icon del" onclick="del(\''+fq+'\')">✕</button></div></div>';var can=isText(it.n)||isHex(it.n);return'<div class="row"><div class="icn">'+iconFor(it.n)+'</div><a class="name" '+(can?'onclick="preview(\''+fq+'\',\''+esc(it.n)+'\')"':'href="'+fileUrl(f)+'" download')+'>'+esc(it.n)+'</a><div class="meta">'+fmtSize(+it.s||0)+'</div><div class="actions">'+(can?'<button class="btn icon cyan" onclick="preview(\''+fq+'\',\''+esc(it.n)+'\')">👁</button>':'')+'<a class="btn icon" href="'+fileUrl(f)+'" download>⬇</a><button class="btn icon del" onclick="del(\''+fq+'\')">✕</button></div></div>'}).join("")}).catch(function(){setStatus(false);document.getElementById("explorerList").innerHTML='<div class="empty">erreur</div>'})}
+function renderBreadcrumb(p){var parts=p.split("/").filter(Boolean),acc="",el=document.getElementById("breadcrumb");el.innerHTML=parts.map(function(x,i){acc+="/"+x;var fq=acc.replace(/\\/g,"\\\\").replace(/'/g,"\\'"),last=i===parts.length-1;return'<span class="sep">/</span>'+(last?'<span class="cur">'+esc(x)+'</span>':'<a onclick="loadPath(\''+fq+'\')">'+esc(x)+'</a>')}).join("")||'<span class="cur">/</span>'}
 
-document.getElementById("upform").onsubmit=function(e){
-  e.preventDefault();
-  var f = document.getElementById("file").files[0];
-  if(!f){ alert("choisis un fichier"); return; }
-  fetch("/file?path="+encodeURIComponent(join(cur,f.name)),{method:"POST",body:f})
-    .then(function(r){ return r.text(); })
-    .then(function(){ document.getElementById("file").value=""; load(cur); })
-    .catch(function(){ alert("upload échoué"); });
-};
+function del(p){if(!confirm("Supprimer "+p+" ?"))return;fetch("/api/rm?path="+encodeURIComponent(p)).then(function(){toast("Supprimé","ok");loadPath(cur);scanAll()}).catch(function(){toast("Échec","err")})}
+function uploadFiles(f,t){if(!f||!f.length)return;Array.from(f).forEach(function(x){fetch("/file?path="+encodeURIComponent(join(t,x.name)),{method:"POST",body:x}).then(function(){toast("↥ "+x.name,"ok");loadPath(cur);scanAll()}).catch(function(){toast("✗ "+x.name,"err")})})}
+var dz=document.getElementById("dropzone");["dragenter","dragover"].forEach(function(e){dz.addEventListener(e,function(ev){ev.preventDefault();dz.classList.add("hover")})});["dragleave","drop"].forEach(function(e){dz.addEventListener(e,function(ev){ev.preventDefault();dz.classList.remove("hover")})});dz.addEventListener("drop",function(ev){uploadFiles(ev.dataTransfer.files,cur)});document.getElementById("fileInput").onchange=function(e){uploadFiles(e.target.files,cur);e.target.value=""};
 
-load("/sdcard");
+function preview(p,n){document.getElementById("modalTitle").textContent=n;document.getElementById("modalDl").href=fileUrl(p);var b=document.getElementById("modalBody");b.innerHTML='<div class="empty">chargement…</div>';document.getElementById("modal").classList.add("open");if(isHex(n)&&!isText(n)){fetch(fileUrl(p)).then(function(r){return r.arrayBuffer()}).then(function(buf){b.innerHTML='<pre>'+esc(hexdump(new Uint8Array(buf)))+'</pre>'}).catch(function(){b.innerHTML='<div class="empty">erreur</div>'});return}fetch(fileUrl(p)).then(function(r){return r.text()}).then(function(t){if(/csv|tsv/.test(ext(n))){var rows=parseCSV(t);if(!rows.length){b.innerHTML='<div class="empty">vide</div>';return}var h=rows[0],bd=rows.slice(1);b.innerHTML='<table><thead><tr>'+h.map(function(x){return"<th>"+esc(x)+"</th>"}).join("")+'</tr></thead><tbody>'+bd.map(function(r){return"<tr>"+r.map(function(c){return"<td>"+esc(c)+"</td>"}).join("")+"</tr>"}).join("")+'</tbody></table>'}else{b.innerHTML='<pre>'+esc(t.slice(0,150000))+(t.length>150000?"\n\n… tronqué":"")+'</pre>'}}).catch(function(){b.innerHTML='<div class="empty">erreur</div>'})}
+function closeModal(){document.getElementById("modal").classList.remove("open")}
+document.addEventListener("keydown",function(e){if(e.key==="Escape")closeModal()});
+
+setInterval(function(){var s=Math.floor((Date.now()-startedAt)/1000),h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60,el=document.getElementById("stat-up");if(el)el.innerHTML=(h>0?h+"h ":"")+(m>0||h>0?m+"m ":"")+sec+"<small>s</small>"},1000);
+
+scanAll();loadPath("/sdcard");pollTimer=setInterval(scanAll,5000);
+document.addEventListener("visibilitychange",function(){if(document.hidden){clearInterval(pollTimer);pollTimer=null}else if(!pollTimer){scanAll();pollTimer=setInterval(scanAll,5000)}});
 </script>
 </body>
 </html>

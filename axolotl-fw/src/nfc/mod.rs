@@ -4,7 +4,11 @@
 //!   PREAMBLE + START_CODE + LEN + LCS + TFI + DATA + DCS + POSTAMBLE
 //!   Lecture : lire 1 byte RDY (0x01 = prêt) puis lire la trame réponse.
 
-use esp_idf_hal::{delay::FreeRtos, delay::BLOCK, i2c::I2cDriver};
+use esp_idf_hal::{
+    delay::{FreeRtos, BLOCK},
+    gpio::{Output, PinDriver},
+    i2c::I2cDriver,
+};
 
 pub mod attacks;
 
@@ -75,6 +79,9 @@ pub struct Pn532<'d> {
 
 impl<'d> Pn532<'d> {
     pub fn new(i2c: I2cDriver<'d>) -> anyhow::Result<Self> {
+        // Pas d'IRQ : la broche gpio1 était le SEUL écart matériel avec la
+        // branche rfid_attacks (qui marchait) et déréglait la comm I²C du PN532
+        // (write ESP_ERR_TIMEOUT/ESP_FAIL). On revient au polling RDY sur le bus.
         let mut pn532 = Self { i2c };
         FreeRtos::delay_ms(500);
 
@@ -204,6 +211,7 @@ impl<'d> Pn532<'d> {
     // (NACK bus) vs (b) read OK mais rdy != 0x01 (PN532 jamais prêt) — un log
     // unique transforme le diagnostic en certitude au lieu de tâtonner.
     fn wait_ready(&mut self, max_tries: u32) -> anyhow::Result<()> {
+        // Polling de l'octet RDY sur l'I²C (comportement rfid_attacks, fiable).
         for _ in 0..max_tries {
             let mut rdy = [0u8; 1];
             if self.i2c.read(PN532_ADDR, &mut rdy, BLOCK).is_ok() && rdy[0] == 0x01 {
