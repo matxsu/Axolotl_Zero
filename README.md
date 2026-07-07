@@ -35,7 +35,7 @@ Ce projet est réalisé dans un **cadre strictement pédagogique** — laboratoi
 |:------:|:----:|:---------:|:----------------------|
 | 🏷️ **NFC / RFID** | PN532 | 13.56 MHz | Lecture UID, dump MIFARE Classic, clonage magic card |
 | 📶 **Wi-Fi** | ESP32-S3 natif | 2.4 GHz | Scan réseaux, deauth, evil twin AP |
-| ⌨️ **BadUSB** | ESP32-S3 USB OTG | USB 2.0 | HID clavier, payloads DuckyScript |
+| ⌨️ **BadUSB** | ESP32-S3 BLE | Bluetooth LE | HID clavier (BLE), payloads DuckyScript |
 | 📡 **Sub-GHz** | CC1101 | 315 / 433 / 868 MHz | Capture, analyse, replay télécommandes |
 
 Chaque module est démontré en laboratoire avec un scénario d'attaque documenté **et** sa contre-mesure associée.
@@ -85,9 +85,9 @@ Chaque module est démontré en laboratoire avec un scénario d'attaque document
 | **Chargeur** | TP4056 (USB-C, CC/CV, 1A) | Charge LiPo |
 | **Boost** | MT3608 (3.7V → 5V) | Alimentation sur batterie |
 | **Batterie** | LiPo 1S 3.7V 1000 mAh | ~3-5h d'autonomie |
-| **Boîtier** | Impression 3D (PLA) — en cours de design | Voir `docs/hardware/` |
+| **Boîtier** | Impression 3D (PLA) — en cours de design | STL/STEP à venir |
 
-📐 **Schémas & pinout complets** → [`docs/architecture.md`](./docs/architecture.md)
+📐 **Schémas & pinout complets** → [`ARCHITECTURE.md`](./ARCHITECTURE.md)
 
 ### État physique actuel
 
@@ -149,14 +149,14 @@ Au démarrage, le device affiche un splash avec le logo Axolotl, puis le menu pr
 
 | Document | Description |
 |:---------|:------------|
-| [📋 Cahier des charges](./docs/cahier-des-charges.md) | Spécification complète du projet (CDC v1.1) |
-| [🏗️ Architecture](./docs/architecture.md) | Architecture hardware + software, pinout, bus |
+| 📋 Cahier des charges | CDC v1.1 — document projet (hors dépôt) |
+| [🏗️ Architecture](./ARCHITECTURE.md) | Architecture hardware + software, pinout, bus |
 | [🤖 CLAUDE.md](./CLAUDE.md) | Contexte projet pour Claude Code |
 | [🏷️ Module NFC](./docs/features/nfc-rfid.md) | Spec détaillée NFC/RFID |
 | [📶 Module Wi-Fi](./docs/features/wifi.md) | Spec détaillée Wi-Fi |
 | [⌨️ Module BadUSB](./docs/features/bad-usb.md) | Spec détaillée BadUSB |
 | [📡 Module Sub-GHz](./docs/features/sub-ghz.md) | Spec détaillée Sub-GHz |
-| [🔌 Hardware](./docs/hardware/) | Schémas, BOM, pinout, fichiers 3D |
+| [🔌 Hardware](./ARCHITECTURE.md#2-architecture-matérielle) | Schémas, BOM, pinout, alimentation (dans ARCHITECTURE.md) |
 
 ---
 
@@ -173,9 +173,9 @@ Au démarrage, le device affiche un splash avec le logo Axolotl, puis le menu pr
 
 ### 🚧 Phase 2 — Modules offensifs *(M3 → M7)*
 - [x] **NFC** : auth MIFARE, dump par dictionnaire (cache clés), clonage magic gen2/gen1a, wipe — émulation Crypto1 écrite mais **non vérifiée sur lecteur réel**
-- [~] **Wi-Fi** : AP SoftAP + file browser web ✅ — scan / deauth / evil twin à faire
-- [ ] **BadUSB** : HID clavier + parser DuckyScript *(pas commencé)*
-- [~] **Sub-GHz** : driver CC1101 écrit (`subghz.rs`) mais **pas câblé** au menu ; capture/replay à finir (GDO0 non connecté)
+- [x] **Wi-Fi** : AP SoftAP + file browser web, scan réseaux, sniff/deauth (handshake WPA → `.pcap`), evil twin + portail captif — **implémenté, validation démo à faire**
+- [x] **BadUSB** : clavier **HID Bluetooth LE** (`esp32-nimble`) + parser DuckyScript, payloads lus sur SD — **implémenté, validation démo à faire**
+- [~] **Sub-GHz** : driver CC1101 écrit (`subghz.rs`) puis **retiré de la branche d'intégration** (`feature/unify`, récupérable via git) ; capture/replay différés
 
 ### 🎯 Phase 3 — Finition *(M7 → M10)*
 - [ ] Intégration boîtier final

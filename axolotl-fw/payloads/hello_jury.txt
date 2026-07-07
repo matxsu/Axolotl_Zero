@@ -1,0 +1,14 @@
+REM === Axolotl Zero - demo BadUSB (labo ESGI) ===
+REM Ouvre Notepad et tape un message. 100 pour cent inoffensif.
+DEFAULTDELAY 30
+DELAY 800
+GUI r
+DELAY 500
+STRING notepad
+ENTER
+DELAY 1000
+STRINGLN Axolotl Zero - injection HID via Bluetooth LE
+STRINGLN Demonstration pedagogique - ESGI 2025-2026
+STRINGLN
+STRINGLN Ce clavier n'est pas branche en USB : il est appaire en BLE.
+STRINGLN Contre-mesure : verrouiller la session + USBGuard.
