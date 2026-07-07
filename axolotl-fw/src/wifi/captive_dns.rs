@@ -5,9 +5,8 @@
 //! que [`super::eviltwin`] puisse libérer le port 53 en sortie et être ré-entré
 //! (sinon un 2ᵉ lancement échouerait au `bind`).
 //!
-//! Répond à TOUTE requête par l'IP du portail : le téléphone croit que tous les
-//! domaines pointent vers nous, son test de connectivité tombe sur notre page
-//! et l'ouvre automatiquement (portail captif façon aéroport).
+//! Répond à toute requête par l'IP du portail : le test de connectivité de l'OS
+//! tombe sur notre page, qui s'ouvre automatiquement.
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};

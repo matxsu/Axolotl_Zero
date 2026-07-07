@@ -152,17 +152,8 @@ mod tests {
 
     #[test]
     fn read_only_acl() {
-        // ACL où tous les data blocks sont en lecture seule (C2=1)
-        // C1=0000, C2=1110 (blocs 1,2,3), C3=0000
-        // Wait — let me build this properly.
-        // For blocks 0,1,2: C1=0,C2=1,C3=0 → octal 010 (read-only with KeyA|B)
-        // For block 3: factory (001)
-        // C1 = 0000, !C1 = 1111
-        // C2 = 0111 (block 0,1,2 set), !C2 = 1000
-        // C3 = 1000 (block 3 set), !C3 = 0111
-        // byte[0] = !C2 nibble high, !C1 nibble low = 1000_1111 = 0x8F
-        // byte[1] = C1 high, !C3 low = 0000_0111 = 0x07
-        // byte[2] = C3 high, C2 low = 1000_0111 = 0x87
+        // Data blocs 0,1,2 en lecture seule (C1=0, C2=1, C3=0 → octal 010),
+        // trailer factory (001). Encodage NXP : 0x8F 0x07 0x87.
         let acl = AccessConditions::parse([0x8F, 0x07, 0x87]).unwrap();
         assert_eq!(acl.blocks[0].as_octal(), 0b010);
         assert_eq!(acl.blocks[1].as_octal(), 0b010);
