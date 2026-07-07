@@ -151,7 +151,6 @@ Au démarrage, le device affiche un splash avec le logo Axolotl, puis le menu pr
 |:---------|:------------|
 | 📋 Cahier des charges | CDC v1.1 — document projet (hors dépôt) |
 | [🏗️ Architecture](./ARCHITECTURE.md) | Architecture hardware + software, pinout, bus |
-| [🤖 CLAUDE.md](./CLAUDE.md) | Contexte projet pour Claude Code |
 | [🏷️ Module NFC](./docs/features/nfc-rfid.md) | Spec détaillée NFC/RFID |
 | [📶 Module Wi-Fi](./docs/features/wifi.md) | Spec détaillée Wi-Fi |
 | [⌨️ Module BadUSB](./docs/features/bad-usb.md) | Spec détaillée BadUSB |

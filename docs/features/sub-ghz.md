@@ -23,7 +23,7 @@ git show c9ee7be:axolotl-fw/src/subghz.rs > /tmp/subghz.rs   # inspection
 1. **Collision GPIO 14** : le CC1101 CS *théorique* est sur GPIO 14, mais cette
    pin sert désormais au **bouton MID** (GPIO 21 d'origine étant inutilisable).
    Il faut réaffecter le CC1101 CS sur une autre pin libre. Voir la note pinout
-   dans `CLAUDE.md` / `ARCHITECTURE.md`.
+   dans `ARCHITECTURE.md`.
 2. **GDO0 non connecté** limitait la capture (repli sur polling RSSI).
 3. Réintroduire `mod subghz;` dans `main.rs` et l'entrée de menu associée.
 

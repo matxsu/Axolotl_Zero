@@ -905,7 +905,7 @@ impl<'d> Pn532<'d> {
     /// Critère de succès = le **WRITE** est ACK : une auth réussie ne garantit pas
     /// le droit d'écriture (access bits) ; en cas de NAK on retente avec l'autre clé
     /// (A↔B). Chaque échec d'auth/write fait passer la carte en HALT → `re_select`
-    /// avant chaque tentative (cf. CLAUDE.md piège #2).
+    /// avant chaque tentative.
     ///
     /// Retourne (blocs_effacés, blocs_total) — bloc 0 exclu du compte.
     pub fn wipe_to_blank<F: FnMut(u8, u8)>(
