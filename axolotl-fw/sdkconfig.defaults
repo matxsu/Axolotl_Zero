@@ -12,7 +12,10 @@ CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 # SD card FAT filesystem
 CONFIG_FATFS_USE_FASTSEEK=y
-CONFIG_FATFS_LONG_FILENAMES=2
+# ESP-IDF 5.x : la clé 4.x `CONFIG_FATFS_LONG_FILENAMES` est ignorée → les LFN
+# restaient désactivés (8.3), d'où l'échec des .pcap et du dossier "handshakes"
+# (nom > 8 car. + extension > 3 car.) avec EINVAL. On active les LFN en heap.
+CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
 
 # SD SPI

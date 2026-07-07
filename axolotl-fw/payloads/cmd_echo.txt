@@ -1,0 +1,11 @@
+REM Demo inoffensive : ouvre une invite de commande et affiche un message.
+REM Aucune commande malveillante n'est executee.
+DEFAULTDELAY 30
+DELAY 800
+GUI r
+DELAY 500
+STRING cmd
+ENTER
+DELAY 800
+STRINGLN echo Axolotl Zero - demo BadUSB HID BLE (labo ESGI)
+STRINGLN echo Contre-mesure : verrouillage session + politique HID.

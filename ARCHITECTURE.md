@@ -219,7 +219,8 @@ Wi-Fi idle), on peut espérer **3–5h**.
 | — | Jumper wires | ~40 | — | Phase prototype |
 | **Total** | | | **~27€** | Hors breadboard/jumpers |
 
-📎 **BOM complète** → [`hardware/bom.md`](./hardware/bom.md) *(à créer)*
+📎 **BOM** : voir le tableau ci-dessus. Un fichier `hardware/bom.md` détaillé
+(prix, références fournisseurs) reste à extraire.
 
 ### État physique actuel et trajectoire
 
@@ -288,14 +289,14 @@ Livrables boîtier :
 | 11 | SPI MOSI | SPI2 | Out | **Partagé LCD+SD+CC1101** |
 | 12 | SPI SCK | SPI2 | Out | **Partagé LCD+SD+CC1101** |
 | 13 | SPI MISO | SPI2 | In | Partagé SD+CC1101 (LCD WO) |
-| 14 | CC1101 CS | SPI2 | Out | |
+| 14 | Joystick CENTER (MID) | GPIO | In PU | ⚠️ CC1101 CS *théorique* — réaffecté au bouton MID car GPIO21 est inutilisable (voir note) |
 | 15 | Joystick UP | GPIO | In PU | Pull-up interne |
 | 16 | Joystick DOWN | GPIO | In PU | |
 | 17 | Joystick LEFT | GPIO | In PU | |
 | 18 | Joystick RIGHT | GPIO | In PU | |
 | 19 | USB D- | USB OTG | Bidi | BadUSB HID |
 | 20 | USB D+ | USB OTG | Bidi | BadUSB HID |
-| 21 | Joystick CENTER | GPIO | In PU | |
+| ~~21~~ | ❌ inutilisable | — | — | Tiré à LOW en permanence → jamais de front ; CENTER déplacé sur GPIO14 |
 | 38 | CC1101 GDO0 | GPIO IRQ | In | TX/RX event |
 | 39 | CC1101 GDO2 | GPIO IRQ | In | FIFO threshold |
 | 46 | LCD BLK | GPIO | Out | Backlight |
@@ -344,15 +345,23 @@ Chaque `SpiDeviceDriver` gère automatiquement son CS et sa configuration. Le HA
 
 L'adresse 7-bit `0x24` correspond au `0x48` en 8-bit avec R/W=0. Le PN532 supporte jusqu'à 400 kHz (Fast mode) mais 100 kHz offre une meilleure marge d'erreur en présence de longues pistes PCB.
 
-### USB OTG — BadUSB
+### Bluetooth LE — BadUSB (HID)
 
 ```
-    USB 2.0 Full-Speed (12 Mbps)
-    ├── Device mode : HID Keyboard (vendor 0x303A / product TBD)
-    └── Controlled by TinyUSB via esp-idf-svc
+    BLE HID Keyboard (esp32-nimble / NimBLE)
+    ├── Advertising : "Axolotl Keyboard"
+    ├── HID report descriptor : clavier + touches média
+    └── Layout AZERTY (FR), DuckyScript interprété depuis la SD
 ```
 
-L'ESP32-S3 supporte nativement USB OTG. L'énumération se fait au moment où le firmware active le mode BadUSB depuis le menu — pas au boot, pour éviter d'énumérer un clavier parasite à chaque alimentation.
+Le BadUSB est implémenté comme un **clavier HID Bluetooth LE**, et non via l'USB
+OTG natif : l'hôte doit appairer « Axolotl Keyboard » avant l'injection. Ce choix
+contourne la complexité du device-USB en Rust sur esp-idf et fonctionne sur toute
+cible BLE. L'advertising démarre à l'entrée du menu BadUSB (pas au boot), et le
+BLE est libéré (`BLEDevice::deinit`) à la sortie.
+
+> ℹ️ L'USB OTG (GPIO19/20) reste utilisé pour le **flash firmware et la console
+> série**, mais pas pour l'injection HID.
 
 ### Wi-Fi — radio intégrée
 
@@ -392,17 +401,27 @@ axolotl-zero/                    Workspace Cargo
 └── axolotl-fw/src/              Firmware ESP32-S3
     ├── main.rs                  Boot + menu + TOUS les écrans (monolithique)
     ├── logo.rs                  Bitmap splash (généré)
+    ├── badusb.rs                Clavier HID Bluetooth LE (esp32-nimble) + DuckyScript (AZERTY FR)
     ├── nfc/
     │   ├── mod.rs               Driver PN532 (I²C, from scratch) + MIFARE
     │   │                        auth/read/write + clone magic + wipe + émulation
     │   └── attacks.rs           Dump par dictionnaire (cache clés Phase 0)
     ├── storage.rs               SD card FAT + flash interne (fallback)
-    ├── wifi/
-    │   ├── mod.rs               AP SoftAP + serveur HTTP (file browser)
-    │   └── index.html           Interface web embarquée (include_bytes!)
-    └── subghz.rs                Driver CC1101 (OOK/Princeton/RSSI) — ÉCRIT mais
-                                 PAS câblé dans main.rs (menu Sub-GHz = placeholder)
+    └── wifi/
+        ├── mod.rs               AP SoftAP + serveur HTTP (file browser)
+        ├── index.html           Interface web embarquée (include_bytes!)
+        ├── scan.rs              Scan réseaux 2.4 GHz (mode station)
+        ├── sniff.rs             Promiscuous 802.11 + capture handshake WPA (.pcap)
+        ├── eviltwin.rs          Evil twin AP + portail captif (phishing creds)
+        ├── portals.rs           Portails captifs façon zphisher (servis depuis SD)
+        └── captive_dns.rs       Mini DNS captif (redirige tout vers le portail)
 ```
+
+> ⚠️ **Sub-GHz retiré de `feature/unify`.** Le driver CC1101 (`subghz.rs`,
+> OOK/Princeton/RSSI) avait été câblé dans `main.rs`, puis retiré (commit
+> `c709f9f`) — il reste récupérable via git. Les sections matérielles ci-dessous
+> conservent le CC1101 car il fait toujours partie du design cible ; seul le
+> firmware de cette branche ne l'embarque pas (menu = 4 entrées, pas de Sub-GHz).
 
 ### Couches logicielles
 
@@ -458,9 +477,9 @@ axolotl-zero/                    Workspace Cargo
     │  - NFC               │
     │  - Wi-Fi             │
     │  - BadUSB            │
-    │  - Sub-GHz           │
     │  - Storage           │
     └──────────────────────┘
+    (Sub-GHz retiré de cette branche — cf. §5.1)
 ```
 
 ### État du screen NFC (détail)
@@ -657,10 +676,10 @@ Les attaques de désauthentification et la création d'un AP rogue sont **techni
 
 ## Annexes
 
-- [`hardware/schematics/`](./hardware/schematics/) — Schémas KiCad (PDF export)
-- [`hardware/bom.md`](./hardware/bom.md) — Bill of materials complet
-- [`features/`](./features/) — Spécifications détaillées par module
-- [`cahier-des-charges.md`](./cahier-des-charges.md) — CDC v1.1
+- [`docs/features/`](./docs/features/) — Spécifications détaillées par module
+- `hardware/schematics/` — Schémas KiCad (PDF export) — *à venir*
+- `hardware/bom.md` — Bill of materials complet — *à venir* (BOM synthétique en §2)
+- Cahier des charges (CDC v1.1) — document projet, hors dépôt
 
 ---
 
