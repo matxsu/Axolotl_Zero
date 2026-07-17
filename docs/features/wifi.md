@@ -3,8 +3,8 @@
 > État au 4 juillet 2026 (branche `feature/unify`). AP + file browser **validés** ;
 > les attaques (scan, sniff/deauth, evil twin) sont **implémentées** mais leur
 > démo matérielle reste à valider. Drivers : `axolotl-fw/src/wifi/` — `mod.rs`
-> (AP + HTTP), `scan.rs`, `sniff.rs`, `eviltwin.rs`, `portals.rs`,
-> `captive_dns.rs`. Attaques portées depuis `feature/wifi_attacks`.
+> (AP + HTTP), `scan.rs`, `sniff.rs`, `eviltwin.rs`, `captive_dns.rs`.
+> Attaques portées depuis `feature/wifi_attacks`.
 
 ## Matériel
 
@@ -23,8 +23,7 @@ Menu **WiFi Tools** : `Scan reseaux`, `Evil twin`, `Sniff / Deauth`,
 | **AP + file browser web** | ✅ | SoftAP `AxolotlZero` (pass `axolotl1`), serveur HTTP sur `192.168.71.1`, interface embarquée (`index.html`), navigation/download/upload de `/sdcard` |
 | **Scan réseaux** | ⚠️ | Mode station, liste SSID/RSSI/canal (`scan.rs`) |
 | **Sniff / Deauth + handshake WPA** | ⚠️ | Promiscuous 802.11, détection EAPOL, sauvegarde du handshake en **`.pcap`** sur SD (`sniff.rs`). ⚠️ box cible **codée en dur** (`BOX_SSID` / `CANAL_DEFAUT`) — à paramétrer |
-| **Evil twin + portail captif** | ⚠️ | SoftAP + DHCP annonçant notre IP comme DNS + **DNS captif** (`captive_dns.rs`) + page de login capturant `email`/`password` (`eviltwin.rs`) |
-| **Portails façon zphisher** | ⚠️ | Templates HTML servis depuis `/sdcard/portals/<site>/index.html`, POST `/login` capturé (pas de PHP côté ESP32) — `portals.rs` |
+| **Evil twin + portail captif** | ⚠️ | SoftAP + DHCP annonçant notre IP comme DNS + **DNS captif** (`captive_dns.rs`) + page de login embarquée (clone Google) capturant `email`/`password`, POST `/login`, écriture des creds en `/loot/creds.csv` (`eviltwin.rs`) |
 | Consultation des creds capturés | ⚠️ | Écran « Creds captures » |
 
 ## Limitations

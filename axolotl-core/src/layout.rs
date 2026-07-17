@@ -1,10 +1,6 @@
 //! Layout des cartes MIFARE Classic — math pure secteur/bloc.
-//!
-//! - Mini : 5 secteurs × 4 blocs = 20 blocs (320 bytes)
-//! - 1K : 16 secteurs × 4 blocs = 64 blocs (1024 bytes)
-//! - 4K : 32 secteurs × 4 blocs + 8 secteurs × 16 blocs = 256 blocs (4096 bytes)
-//!
-//! Le piège du 4K : les secteurs ≥ 32 contiennent 16 blocs au lieu de 4.
+//! Mini 20 blocs / 1K 64 blocs / 4K 256 blocs.
+//! Piège 4K : les secteurs ≥ 32 contiennent 16 blocs au lieu de 4.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ClassicType {

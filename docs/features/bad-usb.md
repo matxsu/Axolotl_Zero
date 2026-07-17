@@ -19,14 +19,14 @@
 | Clavier HID BLE | ⚠️ | `esp32-nimble` (NimBLE), advertising « Axolotl Keyboard », touches clavier + média |
 | Layout **AZERTY (FR)** | ⚠️ | Table de conversion caractère → keycode HID intégrée |
 | Interpréteur DuckyScript | ⚠️ | Sous-ensemble : `REM`, `DELAY`, `DEFAULTDELAY`/`DEFAULT_DELAY`, `STRING`, `STRINGLN`, modificateurs `GUI`/`WIN`/`CTRL`/`SHIFT`/`ALT` (+ combos), touches `ENTER`/`ESC`/`TAB`/flèches |
-| Payloads depuis la SD | ⚠️ | Lus dans `/sdcard/payloads/*.txt`, sélection au menu |
-| Payloads de démo | ✅ | 5 payloads bénins intégrés (`BUILTIN_PAYLOADS`) : Notepad, calc, ouverture URL, verrouillage session, `ipconfig` |
-| Payload test reverse-shell | ⚠️ | Derrière la feature Cargo **opt-in** `lab_payload` (désactivée par défaut) — usage laboratoire uniquement |
-| Libération BLE en sortie | ✅ | `BLEDevice::deinit()` au retour menu (évite un clavier fantôme) |
+| Payloads depuis la SD | ⚠️ | Lus dans `/sdcard/payloads/*.txt`, préfixés `[SD]` au menu |
+| Payloads intégrés | ✅ | 5 entrées `BUILTIN_PAYLOADS` préfixées `[FW]` au menu : Notepad, Calculatrice, Site ESGI, Verrouiller, et `EXPLOIT` |
+| Payload reverse-shell (`EXPLOIT`) | ⚠️ | Reverse-shell PowerShell vers une IP de lab — **toujours compilé** dans `BUILTIN_PAYLOADS`, usage laboratoire uniquement |
+| Libération BLE en sortie | ✅ | `BLEDevice::deinit_full()` au retour menu (évite un clavier fantôme) |
 
-> ℹ️ `BUILTIN_PAYLOADS` est actuellement **défini mais pas branché** dans l'UI
-> (l'écran lit les payloads sur SD). C'est le seul consommateur de la feature
-> `lab_payload` : à câbler comme liste de secours, ou à retirer avec la feature.
+> ℹ️ L'écran BadUSB liste les payloads intégrés (`[FW]`) puis ceux de la SD
+> (`[SD]`). Le payload `EXPLOIT` est toujours présent — usage laboratoire
+> uniquement (cf. Cadre légal).
 
 ## Limitations
 

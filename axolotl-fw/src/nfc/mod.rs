@@ -1,8 +1,6 @@
-//! Module NFC — Driver PN532 (I²C) + MIFARE Classic dump
-//!
-//! Protocole I²C PN532 (AN10609 §6.2.4) :
-//!   PREAMBLE + START_CODE + LEN + LCS + TFI + DATA + DCS + POSTAMBLE
-//!   Lecture : lire 1 byte RDY (0x01 = prêt) puis lire la trame réponse.
+//! Module NFC — Driver PN532 (I²C) + MIFARE Classic dump.
+//! Trame I²C PN532 (AN10609 §6.2.4) : PREAMBLE + START + LEN + LCS + TFI + DATA
+//! + DCS + POSTAMBLE ; lecture précédée d'un byte RDY (0x01 = prêt).
 
 use esp_idf_hal::{
     delay::{FreeRtos, BLOCK},
@@ -46,11 +44,9 @@ const CMD_TG_GET_DATA: u8 = 0x86;
 const CMD_TG_SET_DATA: u8 = 0x8E;
 const CMD_WRITE_REGISTER: u8 = 0x08;
 
-// ── Registres CIU (PN53x) — adresses depuis libnfc chips/pn53x-internal.h ────
-// Pilotage bas niveau du CRC et du bit-framing pour parler à la backdoor des
-// cartes magic gen1a : le réveil 0x40 DOIT partir en trame courte 7 bits, CRC
-// désactivé. InCommunicateThru envoie sinon un octet complet + CRC-A, que la
-// carte gen1a ignore → détection « non-magic » à tort.
+// Registres CIU (PN53x, adresses libnfc pn53x-internal.h) : pilotent CRC et
+// bit-framing pour la backdoor gen1a — le réveil 0x40 doit partir en trame
+// 7 bits, CRC OFF, sinon la carte l'ignore (faux « non-magic »).
 const REG_CIU_TX_MODE: u16 = 0x6302; // bit7 = TxCRCEn
 const REG_CIU_RX_MODE: u16 = 0x6303; // bit7 = RxCRCEn
 const REG_CIU_BIT_FRAMING: u16 = 0x633D; // bits[2:0] = TxLastBits
@@ -85,10 +81,8 @@ impl<'d> Pn532<'d> {
         let mut pn532 = Self { i2c };
         FreeRtos::delay_ms(500);
 
-        // Probe firmware avec retries : au boot, le bus I²C / PN532 peut ne pas
-        // être prêt du premier coup (write ESP_FAIL observé). On réessaye tout le
-        // handshake (wakeup + flush + GetFirmwareVersion) plutôt que de tuer
-        // l'app — avant, un seul échec faisait `return Err` → reboot complet.
+        // Probe firmware avec retries : au boot le PN532 n'est pas prêt du premier
+        // coup. On rejoue tout le handshake plutôt que de faire échouer l'app.
         let mut ver = [0u8; 3];
         let mut ok = false;
         for attempt in 0..10 {
@@ -127,10 +121,8 @@ impl<'d> Pn532<'d> {
         );
 
         pn532.sam_configuration()?;
-        // MxRtyPassiveActivation=2 : InListPassiveTarget termine en <20ms si
-        // aucune carte n'est présente. Sans ça, le PN532 tourne indéfiniment,
-        // le wait_ready(30) de read_uid expire, et la prochaine commande I²C
-        // arrive pendant que le PN532 est encore occupé → corruption du bus.
+        // MxRtyPassiveActivation=2 : InListPassiveTarget rend la main en <20 ms
+        // sans carte, sinon il boucle et la commande I²C suivante corrompt le bus.
         let _ = pn532.send_frame(CMD_RF_CONFIGURATION, &[0x05, 0xFF, 0x01, 0x02]);
         let _ = pn532.read_ack();
         let _ = pn532.read_response(CMD_RF_CONFIGURATION);
@@ -207,9 +199,8 @@ impl<'d> Pn532<'d> {
     }
 
     /// Attend RDY == 0x01, max_tries × 10 ms.
-    // TODO(nfc): si "PN532 timeout" réapparaît, distinguer ici (a) i2c.read Err
-    // (NACK bus) vs (b) read OK mais rdy != 0x01 (PN532 jamais prêt) — un log
-    // unique transforme le diagnostic en certitude au lieu de tâtonner.
+    // TODO(nfc): en cas de "PN532 timeout", distinguer NACK bus (i2c.read Err) de
+    // rdy != 0x01 (PN532 jamais prêt) via un log dédié.
     fn wait_ready(&mut self, max_tries: u32) -> anyhow::Result<()> {
         // Polling de l'octet RDY sur l'I²C (comportement rfid_attacks, fiable).
         for _ in 0..max_tries {
@@ -281,10 +272,9 @@ impl<'d> Pn532<'d> {
         Ok(())
     }
 
-    /// Active (ON) ou coupe (OFF) le CRC TX+RX du CIU. OFF pour dialoguer avec
-    /// la backdoor gen1a (0x40/0x43) ; ON pour les commandes MIFARE normales (le
-    /// CIU ajoute alors le CRC-A). 0x80/0x00 = défaut 106 kbps Type A ±CRC ; de
-    /// toute façon le prochain InListPassiveTarget reconfigure ces registres.
+    /// Active/coupe le CRC TX+RX du CIU. OFF pour la backdoor gen1a (0x40/0x43),
+    /// ON pour les commandes MIFARE normales. Le prochain InListPassiveTarget
+    /// reconfigure de toute façon ces registres.
     fn set_crc(&mut self, on: bool) {
         let v = if on { 0x80 } else { 0x00 };
         if let Err(e) = self.write_register(&[(REG_CIU_TX_MODE, v), (REG_CIU_RX_MODE, v)]) {
@@ -300,17 +290,9 @@ impl<'d> Pn532<'d> {
         }
     }
 
-    /// Ouvre la backdoor d'une carte magic **gen1a**.
-    ///
-    /// Séquence canonique (libnfc `utils/nfc-mfclassic.c::unlock_card`) :
-    ///   HALT (0x50 0x00 + CRC) → 0x40 en **trame 7 bits, CRC OFF** → ACK 0x0A
-    ///   → 0x43 **octet plein, CRC OFF** → ACK 0x0A.
-    /// Laisse le CIU **CRC ON** en sortie (état requis par les WRITE 0xA0 qui
-    /// suivent). La carte doit déjà être sélectionnée (InListPassiveTarget fait
-    /// par l'appelant). Réessaie `GEN1A_UNLOCK_TRIES` fois.
-    ///
-    /// Loggue les réponses brutes 0x40/0x43 : c'est le seul moyen de distinguer,
-    /// au prochain flash, « mauvaise adresse registre » de « carte muette ».
+    /// Ouvre la backdoor gen1a (libnfc `unlock_card`) : HALT → 0x40 (trame 7 bits,
+    /// CRC OFF) → 0x43 (octet plein, CRC OFF), ACK 0x0A attendu. Laisse le CIU
+    /// CRC ON en sortie. Carte déjà sélectionnée. Réessaie `GEN1A_UNLOCK_TRIES` fois.
     fn gen1a_unlock(&mut self) -> bool {
         for attempt in 1..=GEN1A_UNLOCK_TRIES {
             // HALT avec CRC : place la carte en état HALT, où le réveil l'attend.
@@ -482,14 +464,9 @@ impl<'d> Pn532<'d> {
         FreeRtos::delay_ms(20);
     }
 
-    /// Re-sélectionne la carte après un auth raté.
-    ///
-    /// Problème : `InRelease` (0x52) envoie HLTA à la carte → carte passe en
-    /// état HALT. `InListPassiveTarget` n'envoie que REQA (0x26) qui est ignoré
-    /// par les cartes HALT → re_select échoue toujours.
-    ///
-    /// Fix : cycle RF (off → on) après InRelease. La carte perd l'alimentation,
-    /// son état HALT est effacé. Au rallumage elle revient en IDLE et répond à REQA.
+    /// Re-sélectionne la carte après un auth raté. `InRelease` la met en HALT (où
+    /// REQA est ignoré) : un cycle RF off→on la ramène en IDLE pour qu'elle
+    /// réponde de nouveau à InListPassiveTarget.
     pub fn re_select(&mut self) -> bool {
         self.rf_cycle();
         for i in 0..10 {
@@ -502,13 +479,9 @@ impl<'d> Pn532<'d> {
         false
     }
 
-    /// Cycle RF off→on : InRelease (libère la cible + HLTA) puis coupe/rallume le
-    /// champ pour power-cycler toute carte présente (HALT/ACTIVE → IDLE), de
-    /// nouveau détectable. C'est la SEULE séquence prouvée fiable (re_select la
-    /// lance des dizaines de fois par dump sans wedger le bus). Aucune autre
-    /// commande (SAMConfiguration, MaxRetries…) ne doit s'ajouter ici : chaque
-    /// commande en plus = une occasion de désync du buffer I²C (pas d'IRQ, tout
-    /// repose sur le polling RDY).
+    /// Cycle RF off→on : InRelease puis coupe/rallume le champ pour power-cycler
+    /// la carte (HALT/ACTIVE → IDLE). Ne rien ajouter ici : toute commande en plus
+    /// risque de désync le buffer I²C (polling RDY, pas d'IRQ).
     fn rf_cycle(&mut self) {
         self.in_release();
 
@@ -529,39 +502,25 @@ impl<'d> Pn532<'d> {
         FreeRtos::delay_ms(60);
     }
 
-    /// Réinitialise le champ RF pour autoriser une NOUVELLE détection.
-    ///
-    /// Après `read_uid` (InListPassiveTarget → REQA), la carte passe en état
-    /// ACTIVE et **ne répond plus à REQA** : impossible de la re-détecter tant
-    /// qu'elle reste dans le champ. On power-cycle le champ (cf. [`rf_cycle`])
-    /// pour la remettre en IDLE. La boucle de scan re-détecte ensuite.
-    ///
-    /// Identique au noyau de `re_select` : exactement la séquence prouvée fiable,
-    /// rien de plus (pas de SAMConfiguration ni MaxRetries — voir [`recover`]).
+    /// Réinitialise le champ RF pour autoriser une nouvelle détection : après
+    /// `read_uid`, la carte reste ACTIVE et ignore REQA ; un power-cycle du champ
+    /// (cf. [`rf_cycle`]) la remet en IDLE.
     pub fn reset_field(&mut self) {
         self.rf_cycle();
     }
 
-    /// Récupération lourde après une erreur de communication (ex. "PN532
-    /// timeout") : draine d'éventuels octets bufferisés (une trame non lue
-    /// décale tous les reads suivants), puis ré-applique SAMConfiguration +
-    /// MaxRetries.
-    ///
-    /// À appeler UNIQUEMENT depuis le handler d'erreur du scan. Si ça se
-    /// déclenche à chaque scan, c'est que `reset_field` est encore en cause —
-    /// c'est le signal, pas une invitation à empiler des commandes ailleurs.
+    /// Récupération lourde après une erreur de comm ("PN532 timeout") : draine le
+    /// buffer I²C (une trame non lue décale les reads suivants) puis ré-applique
+    /// SAMConfiguration + MaxRetries. À n'appeler que depuis le handler d'erreur.
     pub fn recover(&mut self) {
         log::warn!("PN532 recover: re-init apres erreur de comm");
-        // Vider agressivement le bus I2C de tout octet bloqué
+        // Vide le bus I²C de tout octet bloqué.
         for _ in 0..10 {
-            // Augmenté à 10 passages
             let mut buf = [0u8; 32];
-            // On ignore silencieusement les erreurs de lecture ici
             let _ = self.i2c.read(PN532_ADDR, &mut buf, BLOCK);
             FreeRtos::delay_ms(10);
         }
 
-        // Relance d'un cycle RF forcé pour réinitialiser la carte cible
         self.rf_cycle();
 
         let _ = self.sam_configuration();
@@ -572,11 +531,9 @@ impl<'d> Pn532<'d> {
 
     // ── API publique — clone vers carte magic ─────────────────────────────
 
-    /// Reconstruit le sector trailer pour un clone.
-    /// Le dump renvoie KeyA masqué (00) — on réinjecte les vraies clés trouvées.
-    /// `reversible=true` : access bits transport FF0780 → la carte clonée reste
-    /// réinscriptible (data write A|B, trailer write A) pour re-tester facilement.
-    /// `reversible=false` : access bits d'origine (clone 100% fidèle).
+    /// Reconstruit le sector trailer d'un clone en réinjectant les vraies clés
+    /// (le dump renvoie KeyA masqué). `reversible` : access bits transport FF0780
+    /// (carte re-inscriptible) sinon access bits d'origine (clone fidèle).
     fn reconstruct_trailer(
         sector: u8,
         dump: &MifareDump,
@@ -615,17 +572,9 @@ impl<'d> Pn532<'d> {
         t
     }
 
-    /// Clone un dump vers une carte magic (gen2/CUID — bloc 0 réinscriptible
-    /// par commande WRITE normale, sans backdoor).
-    ///
-    /// - Authentifie la cible avec SA clé courante (FF sur vierge, sinon KeyA
-    ///   reconstruite pour re-clone). L'UID change après écriture du bloc 0,
-    ///   donc on relit l'UID cible à chaque secteur.
-    /// - Écrit tous les blocs en ordre linéaire, **trailer en dernier** par secteur.
-    /// - Bloc 0 (UID) inclus : son écriture réussit = carte gen2/CUID confirmée.
-    ///
-    /// Retourne `(blocs_écrits, bloc0_écrit)`. `bloc0_écrit=false` → carte standard
-    /// (bloc 0 verrouillé) : UID non clonable par cette voie.
+    /// Clone un dump vers une carte magic gen2/CUID (bloc 0 réinscriptible par
+    /// WRITE normal) ; trailer écrit en dernier par secteur. Retourne
+    /// `(blocs_écrits, bloc0_écrit)` — `bloc0_écrit=false` = UID non clonable.
     pub fn clone_to_magic<F: FnMut(u8, u8)>(
         &mut self,
         dump: &MifareDump,
@@ -638,14 +587,9 @@ impl<'d> Pn532<'d> {
         let mut written = 0u32;
         let mut block0_written = false;
 
-        // ── GARDE-FOU : la cible doit être magic (bloc 0 réinscriptible) ───
-        // Test NON DESTRUCTIF : auth secteur 0, relire bloc 0, réécrire ses
-        // PROPRES octets. Si le WRITE passe → gen2/CUID. On essaye FFFF (carte
-        // vierge) PUIS la KeyA reconstruite (re-clone d'une magic déjà clonée).
-        //
-        // Si le bloc 0 n'est PAS réinscriptible → carte standard/gen1a → on
-        // ABANDONNE sans rien écrire : un clone partiel sur carte non-magic
-        // réécrit les trailers et BRICK les secteurs (cas vécu sur 8E:0C:19:03).
+        // Garde-fou : test non destructif que le bloc 0 est réinscriptible (auth
+        // secteur 0, relire/réécrire ses propres octets, clés FFFF puis KeyA). Si
+        // non → on abandonne sans rien écrire (un clone partiel brique la carte).
         let recon0 = Self::reconstruct_trailer(0, dump, keys, reversible);
         let key_a0: [u8; 6] = recon0[0..6].try_into().unwrap();
 
@@ -773,11 +717,8 @@ impl<'d> Pn532<'d> {
             self.re_select();
         }
 
-        // ── Bloc 0 (UID) écrit en tout dernier ────────────────────────────
-        // Secteur 0 vient d'être cloné → sa KeyA est maintenant 4A63… (FF0780,
-        // bloc 0 = data block write A|B). On ré-auth avec cette KeyA et on écrit
-        // le bloc 0. Comme plus rien ne suit, un éventuel drop de session post-UID
-        // n'impacte aucun autre bloc.
+        // Bloc 0 (UID) écrit en dernier : le secteur 0 vient d'être cloné, on
+        // ré-authentifie avec sa nouvelle KeyA (FF0780) pour écrire le bloc 0.
         let recon0 = Self::reconstruct_trailer(0, dump, keys, reversible);
         let key_a0: [u8; 6] = recon0[0..6].try_into().unwrap();
         self.re_select();
@@ -848,15 +789,9 @@ impl<'d> Pn532<'d> {
         Ok((dump, keys))
     }
 
-    /// Wipe gen1a : efface tous les blocs via le backdoor 0x40/0x43 sans auth.
-    ///
-    /// Ouvre la backdoor via [`Self::gen1a_unlock`] (HALT → 0x40 7-bit CRC-off →
-    /// 0x43), puis WRITE (0xA0) bloc par bloc (CRC-A ajouté par le CIU), avec
-    /// retries (`gen1a_write_block`).
-    /// Trailers → transport state : `FF FF FF FF FF FF FF 07 80 69 FF FF FF FF FF FF`
-    /// Blocs data → 16 zéros (sauf bloc 0 conservé tel quel pour ne pas bricker l'UID).
-    ///
-    /// Retourne (blocs_effacés, blocs_total).
+    /// Wipe gen1a : ouvre la backdoor ([`Self::gen1a_unlock`]) puis WRITE 0xA0
+    /// bloc par bloc — trailers en transport state, data à zéro (bloc 0 conservé
+    /// pour ne pas bricker l'UID). Retourne (blocs_effacés, blocs_total).
     pub fn wipe_gen1a<F: FnMut(u8, u8)>(&mut self, mut on_block: F) -> (u8, u8) {
         if !self.gen1a_unlock() {
             log::warn!("wipe_gen1a: backdoor gen1a indisponible (0x40/0x43 sans ACK), abandon");
@@ -892,22 +827,9 @@ impl<'d> Pn532<'d> {
         (written, 63)
     }
 
-    /// Remet une carte magic à blanc (transport state NXP), bloc 0 (UID) conservé.
-    ///
-    /// Gère les deux familles automatiquement :
-    /// - **gen1a** : effacement via backdoor `0x40/0x43` (cf. [`Self::wipe_gen1a`]),
-    ///   sans authentification.
-    /// - **gen2/CUID** : pas de backdoor → authentification secteur par secteur.
-    ///   Clés essayées dans l'ordre : `FF`/`00` (carte vierge ou transport), puis
-    ///   les clés du dernier dump en RAM (`last_keys`, pour re-wiper une carte qu'on
-    ///   vient de cloner), puis le dictionnaire complet en dernier recours.
-    ///
-    /// Critère de succès = le **WRITE** est ACK : une auth réussie ne garantit pas
-    /// le droit d'écriture (access bits) ; en cas de NAK on retente avec l'autre clé
-    /// (A↔B). Chaque échec d'auth/write fait passer la carte en HALT → `re_select`
-    /// avant chaque tentative.
-    ///
-    /// Retourne (blocs_effacés, blocs_total) — bloc 0 exclu du compte.
+    /// Remet une carte magic à blanc (transport state NXP), bloc 0 conservé.
+    /// gen1a via backdoor sans auth, gen2/CUID par auth+WRITE (clés FF/00, puis
+    /// `last_keys`, puis dict). Retourne (blocs_effacés, total), bloc 0 exclu.
     pub fn wipe_to_blank<F: FnMut(u8, u8)>(
         &mut self,
         last_keys: &[attacks::SectorKey],
@@ -994,10 +916,9 @@ impl<'d> Pn532<'d> {
         (written, total)
     }
 
-    /// Écrit `data` dans `block` en cherchant une clé qui authentifie *et* autorise
-    /// l'écriture. Ordre : clé déjà validée pour le secteur (`working`), puis `FF`/`00`,
-    /// puis `last_keys` du secteur, puis dictionnaire complet — chaque clé testée en
-    /// KeyA puis KeyB. Renvoie `true` dès que le WRITE est ACK.
+    /// Écrit `data` dans `block` en cherchant une clé qui authentifie et autorise
+    /// l'écriture (`working`, puis FF/00, `last_keys`, dict ; KeyA puis KeyB).
+    /// Renvoie `true` dès que le WRITE est ACK.
     fn wipe_block_any_key(
         &mut self,
         block: u8,
@@ -1065,11 +986,9 @@ impl<'d> Pn532<'d> {
         self.mifare_write_block(block, data).is_ok()
     }
 
-    /// Clone un dump vers une carte gen1a, **backdoor déjà ouverte** par
-    /// [`Self::gen1a_unlock`] (0x40/0x43 ACK'd, CRC restauré ON par l'appelant).
-    ///
-    /// Le backdoor bypass l'authentification MIFARE → tous les blocs (y compris
-    /// le bloc 0 / UID) sont accessibles en écriture directe via WRITE (0xA0).
+    /// Clone un dump vers une carte gen1a, backdoor déjà ouverte par
+    /// [`Self::gen1a_unlock`]. Le backdoor bypass l'auth MIFARE : tous les blocs
+    /// (bloc 0 / UID inclus) sont écrits directement via WRITE (0xA0).
     fn clone_gen1a_unlocked<F: FnMut(u8, u8)>(
         &mut self,
         dump: &MifareDump,
@@ -1180,16 +1099,13 @@ impl<'d> Pn532<'d> {
         Ok(())
     }
 
-    /// Détecte la taille mémoire d'une carte NTAG via le Capability Container (page 3).
-    /// CC byte 2 contient la capacité en unités de 8 bytes : 0x12=NTAG213, 0x3E=NTAG215, 0x6F=NTAG216.
-    /// Retourne le nombre total de pages lisibles (user data + lock).
-    /// Sur Ultralight classique le CC est différent, on retombe sur 16 pages.
+    /// Détecte la taille d'une carte NTAG via le Capability Container (page 3,
+    /// byte 2 : 0x12=213, 0x3E=215, 0x6F=216). Retourne le nombre de pages
+    /// lisibles ; Ultralight classique → 16 pages par défaut.
     pub fn ntag_detect_pages(&mut self) -> anyhow::Result<u8> {
         let page3 = self.ultralight_read_page(3)?;
-        // CC structure: [magic, version, size, access]
-        // NTAG213: size=0x12 → 144 bytes user → 45 pages totales (4..39 data + lock)
-        // NTAG215: size=0x3E → 504 bytes user → 135 pages
-        // NTAG216: size=0x6F → 888 bytes user → 231 pages
+        // CC = [magic, version, size, access] ; size → pages totales :
+        // 0x12 NTAG213=45, 0x3E NTAG215=135, 0x6F NTAG216=231.
         let pages = match page3[2] {
             0x12 => 45,
             0x3E => 135,
@@ -1207,10 +1123,9 @@ impl<'d> Pn532<'d> {
         Ok(pages)
     }
 
-    /// Écrit un dump Ultralight/NTAG sur la carte cible courante.
-    /// Saute les pages 0..3 (UID + lock + CC, read-only sur cartes standard).
-    /// `on_page(page, total_pages)` : callback de progression.
-    /// Retourne le nombre de pages écrites avec succès.
+    /// Écrit un dump Ultralight/NTAG sur la carte courante (saute les pages 0..3 :
+    /// UID + lock + CC). `on_page(page, total)` = progression ; retourne le nombre
+    /// de pages écrites.
     pub fn ultralight_clone<F: FnMut(u8, u8)>(
         &mut self,
         data: &[u8],
@@ -1281,12 +1196,9 @@ pub enum EmulResult {
 }
 
 impl<'d> Pn532<'d> {
-    /// Configure le PN532 en mode cible passif 106kbps ISO14443-A.
-    /// Le PN532 répondra automatiquement aux REQA/WUPA et aux anticollisions.
-    /// Après SELECT, toutes les commandes arrivent via `tg_get_data`.
-    ///
-    /// ATQA pour MIFARE Classic 1K = [0x04, 0x00], SAK = 0x08.
-    /// ATQA pour MIFARE Classic 4K = [0x02, 0x00], SAK = 0x18.
+    /// Configure le PN532 en cible passive 106 kbps ISO14443-A (répond seul aux
+    /// REQA/WUPA + anticollision ; commandes ensuite via `tg_get_data`).
+    /// ATQA/SAK : 1K = [04 00]/0x08, 4K = [02 00]/0x18.
     pub fn tg_init_as_target(
         &mut self,
         uid4: &[u8; 4],
@@ -1375,15 +1287,9 @@ impl<'d> Pn532<'d> {
         Ok(result)
     }
 
-    /// Émule un badge MIFARE Classic à partir d'un dump.
-    ///
-    /// ## Protocole Crypto1 implémenté :
-    /// - AUTH: génère NT aléatoire, vérifie AR du lecteur, envoie AT
-    /// - READ: déchiffre la commande, envoie le bloc du dump chiffré
-    /// - Autres commandes: NACK chiffré, reset de la session
-    ///
-    /// Le PN532 gère anticollision/SELECT/CRC automatiquement en mode cible.
-    /// On gère Crypto1 côté ESP32 (le PN532 passe les octets bruts chiffrés).
+    /// Émule un badge MIFARE Classic depuis un dump. Crypto1 géré côté ESP32
+    /// (le PN532 relaie les octets bruts) : AUTH (NT aléatoire, vérifie AR, envoie
+    /// AT), READ (bloc chiffré), autres commandes → NACK chiffré + reset session.
     pub fn emulate_mifare<F: FnMut(&str)>(
         &mut self,
         dump: &MifareDump,

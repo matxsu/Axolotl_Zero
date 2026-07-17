@@ -53,12 +53,9 @@ impl MifareDump {
         out
     }
 
-    /// Calcule un résumé des access bits sur tous les secteurs.
-    /// Pour chaque secteur :
-    /// - factory   si l'ACL parsée vaut le défaut NXP (FF 07 80)
-    /// - custom    si l'ACL est valide mais différente
-    /// - corrupt   si la redondance inversée échoue
-    /// - unreadable si le trailer n'a pas été lu
+    /// Résumé des access bits par secteur : factory (défaut NXP FF 07 80),
+    /// custom (ACL valide différente), corrupt (redondance KO), unreadable
+    /// (trailer non lu).
     pub fn access_summary(&self) -> AccessSummary {
         let mut s = AccessSummary::default();
         for sector in 0..self.card_type.sector_count() {
@@ -84,10 +81,8 @@ impl MifareDump {
         s
     }
 
-    /// Désérialise depuis un .mfd. La taille doit correspondre à `card_type`
-    /// (1024 pour 1K, 4096 pour 4K). Tous les blocs sont marqués lisibles
-    /// car on assume que le fichier stocke un dump complet.
-    /// Retourne `None` si la taille ne correspond pas.
+    /// Désérialise un .mfd (taille = `card_type.dump_size()`, sinon `None`).
+    /// Tous les blocs sont marqués lisibles (dump supposé complet).
     pub fn from_mfd_bytes(card_type: ClassicType, data: &[u8]) -> Option<Self> {
         if data.len() != card_type.dump_size() {
             return None;

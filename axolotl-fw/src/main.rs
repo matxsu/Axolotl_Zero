@@ -902,17 +902,12 @@ where
                         break;
                     }
                 }
-                // Reset toujours — le PN532 doit revenir en état propre pour le
-                // prochain scan. (recover() a été essayé ici mais casse la
-                // détection normale : le drain I2C agressif + les commandes
-                // supplémentaires décalent les reads suivants → plus aucun badge
-                // détecté. reset_field() est la séquence prouvée fiable ; la
-                // récupération lourde reste réservée au handler d'erreur de comm.)
+                // Reset léger pour repartir propre au prochain scan. recover() est
+                // trop agressif ici (drain I²C décale les reads → plus de détection),
+                // réservé au handler d'erreur de comm.
                 pn532.reset_field();
-                // LEFT ici signifiait "quitter cette carte", PAS "quitter le NFC".
-                // On consomme l'appui et on retourne au scan : poser une nouvelle
-                // carte la détecte directement. Pour sortir du NFC, ré-appuyer
-                // LEFT sur l'écran d'attente (test en haut de boucle).
+                // LEFT ici = "quitter cette carte", pas le NFC : on consomme l'appui
+                // et on retourne au scan. Sortie du NFC = LEFT sur l'écran d'attente.
                 while btn_lft.is_low() {
                     FreeRtos::delay_ms(10);
                 }
@@ -1029,21 +1024,9 @@ where
                 }
                 FreeRtos::delay_ms(20);
             }
-            // Dump TOTALEMENT vide = carte perdue en cours de route (auth ratée →
-            // HALT, puis re_select en échec ×5). Le bus PN532 a enchaîné des
-            // dizaines de rf_cycle et reste souvent désync → le simple
-            // reset_field() fait au retour dans run_nfc_scan ne suffit pas et le
-            // scan suivant reste mort ("plus scanner de badge après un dump raté").
-            //
-            // On force la récupération lourde (drain I2C agressif + SAM +
-            // MaxRetries). Un SEUL recover ne suffit pas toujours : au boot il en
-            // faut ~4 avant que le 1er read_uid cesse de renvoyer une erreur de
-            // comm. On répète donc TANT QUE read_uid erre encore ; Ok(None) = bus
-            // sain sans carte → on s'arrête. Borné à 5 essais.
-            //
-            // Ciblé : ne s'exécute QUE sur l'échec total, jamais sur le chemin
-            // par-carte sain (cf. note reset_field/recover dans run_nfc_scan) ni
-            // sur un dump partiel exploitable.
+            // Dump vide = carte perdue : le bus PN532 reste souvent désync et le
+            // reset_field() du retour ne suffit pas. On force recover() en boucle
+            // (jusqu'à 5×) tant que read_uid erre ; Ok(None) = bus sain, on stoppe.
             if readable_count == 0 {
                 log::warn!("Dump vide — recover PN532 pour rétablir le scan");
                 for essai in 1..=5 {
@@ -1057,10 +1040,8 @@ where
             last_dumps.classic = Some(dump);
             last_dumps.classic_keys = found_keys;
         }
-        // `mifare_dump` renvoie toujours Ok (dump_all_sectors donne un tuple, pas
-        // de `?`) : une carte perdue revient en Ok avec readable_count==0, géré
-        // ci-dessus. Cette branche est donc actuellement inatteignable — conservée
-        // au cas où mifare_dump gagnerait un `?` un jour.
+        // `mifare_dump` renvoie toujours Ok (carte perdue = readable_count==0,
+        // géré plus haut) : branche inatteignable, conservée par sûreté.
         Err(e) => {
             log::warn!("Dump err: {:?}", e);
             draw_nfc_status(display, "Dump echoue")?;
@@ -1072,10 +1053,6 @@ where
 
 // ── Sous-menu Attaques NFC ─────────────────────────────────────────────────
 
-// Darkside / Nested / "Magic?" retirés : ces attaques crypto exigent un contrôle
-// bit-timing que le PN532 (I²C) ne permet pas → un Proxmark3 est requis. Le clone
-// teste déjà gen1a/gen2 tout seul (cf. clone_to_magic), donc plus besoin d'un test
-// "Magic?" séparé. Reste le wipe gen1a (utile sur carte magic réinscriptible).
 const ATTACK_ITEMS: &[&str; 2] = &["Remettre a blanc", "Retour"];
 
 fn draw_attack_menu<D>(display: &mut D, selected: usize) -> anyhow::Result<()>
@@ -1517,14 +1494,9 @@ fn load_dump_file(path: &str) -> Option<(nfc::MifareDump, Vec<nfc::attacks::Sect
     Some((dump, keys))
 }
 
-/// Scanne les DEUX racines de stockage (`/sdcard` puis `/spiflash`) pour les
-/// dumps `.mfd`. Un dump écrit sur la flash interne (SD absente au moment du
-/// dump) reste ainsi visible quand la SD monte à un boot ultérieur — sinon le
-/// menu liste la mauvaise racine et affiche "Aucun dump sauve".
-///
-/// Retourne (nom_affiché, chemin_absolu), dédupliqué par nom (SD prioritaire)
-/// puis trié. L'extension est testée sans tenir compte de la casse : FAT 8.3
-/// peut remonter `.MFD` en majuscules selon la config LFN.
+/// Scanne `/sdcard` puis `/spiflash` pour les dumps `.mfd` (extension insensible
+/// à la casse). Retourne (nom_affiché, chemin_absolu) dédupliqué par nom
+/// (SD prioritaire) puis trié.
 fn collect_saved_dumps() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for root in ["/sdcard", "/spiflash"] {
@@ -1755,7 +1727,6 @@ where
         log::info!("emul: {}", msg);
     });
 
-    // Affiche le résultat final
     let result_str = match result {
         nfc::EmulResult::Done => "Session terminee",
         nfc::EmulResult::Timeout => "Timeout (pas de lecteur)",

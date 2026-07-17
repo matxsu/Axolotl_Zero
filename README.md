@@ -149,7 +149,7 @@ Au démarrage, le device affiche un splash avec le logo Axolotl, puis le menu pr
 
 | Document | Description |
 |:---------|:------------|
-| 📋 Cahier des charges | CDC v1.1 — document projet (hors dépôt) |
+| 📋 [Cahier des charges](./docs/axolotl_zero_cdc.docx) | CDC v1.1 — spécification complète du projet |
 | [🏗️ Architecture](./ARCHITECTURE.md) | Architecture hardware + software, pinout, bus |
 | [🏷️ Module NFC](./docs/features/nfc-rfid.md) | Spec détaillée NFC/RFID |
 | [📶 Module Wi-Fi](./docs/features/wifi.md) | Spec détaillée Wi-Fi |

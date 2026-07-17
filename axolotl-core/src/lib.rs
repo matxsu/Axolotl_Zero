@@ -1,7 +1,5 @@
 //! axolotl-core — Logique pure pour Axolotl Zero.
-//!
-//! Aucune dépendance sur esp-idf : ce crate est testable sur host avec
-//! `cargo test -p axolotl-core`.
+//! Sans dépendance esp-idf, testable sur host : `cargo test -p axolotl-core`.
 
 pub mod acl;
 pub mod card;

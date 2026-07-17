@@ -1,10 +1,6 @@
 //! Crypto1 — chiffrement propriétaire MIFARE Classic.
-//!
-//! Transcription Rust fidèle de crapto1 (nfc-tools/mfoc).
-//!
-//! Références :
-//! - Garcia et al., "Dismantling MIFARE Classic", ESORICS 2008
-//! - crapto1 : https://github.com/nfc-tools/mfoc/tree/master/src/crapto1
+//! Port Rust de crapto1 (nfc-tools/mfoc). Réf : Garcia et al.,
+//! "Dismantling MIFARE Classic", ESORICS 2008.
 
 /// Polynôme de rétroaction pour les bits impairs (positions 1,3,5,…,47).
 const LF_POLY_ODD: u32 = 0x29CE5C;
@@ -92,14 +88,11 @@ impl Crypto1 {
         w
     }
 
-    /// Fonction de filtre non-linéaire — port exact de `filter()` de crapto1.
-    ///
-    /// Prend les 20 bits bas de `odd` (bits 1..39 du LFSR), divisés en 5 nibbles.
-    /// Chaque nibble indexe une table 4-bit→2-bit encodée dans une constante 32 bits.
-    /// Le résultat final est le bit f de 0xe8a7.
+    /// Filtre non-linéaire — port exact de `filter()` de crapto1.
+    /// 5 nibbles de `odd` indexent des tables 4→2 bits ; sortie = bit f de 0xe8a7.
     #[inline]
     fn filter(x: u32) -> u8 {
-        // wrapping_shr : shift de 32 → 0, comme C unsigned overflow.
+        // wrapping_shr : shift de 32 → 0, comme un overflow unsigned C.
         let mut f: u32;
         f  = 0x000f_22c0_u32.wrapping_shr(1 + (x        & 0xf) * 2) & 3;
         f ^= 0x0006_c9c0_u32.wrapping_shr(1 + (x >>  4  & 0xf) * 2) & 3;
@@ -132,11 +125,8 @@ pub fn parity_byte(b: u8) -> u8 {
     p & 1
 }
 
-// ── PRNG de la carte MIFARE Classic ──────────────────────────────────────────
-//
-// LFSR 32 bits, polynôme libnfc/mfoc :
-//   feedback = bit0 ^ bit2 ^ bit3 ^ bit5
-//   x_new    = (x >> 1) | (feedback << 31)
+// PRNG carte MIFARE Classic — LFSR 32 bits (libnfc/mfoc) :
+// feedback = bit0 ^ bit2 ^ bit3 ^ bit5 ; x_new = (x >> 1) | (feedback << 31).
 
 /// Un pas du PRNG MIFARE Classic.
 #[inline]

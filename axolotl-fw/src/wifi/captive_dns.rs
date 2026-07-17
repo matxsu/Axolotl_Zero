@@ -1,12 +1,6 @@
-//! Mini serveur DNS pour portail captif.
-//!
-//! Porté depuis `feature/wifi_attacks:src/captive_dns.rs`. Adaptation menu :
-//! la boucle est rendue **arrêtable** via [`STOP`] + un timeout de lecture, pour
-//! que [`super::eviltwin`] puisse libérer le port 53 en sortie et être ré-entré
-//! (sinon un 2ᵉ lancement échouerait au `bind`).
-//!
-//! Répond à toute requête par l'IP du portail : le test de connectivité de l'OS
-//! tombe sur notre page, qui s'ouvre automatiquement.
+//! Mini serveur DNS pour portail captif : répond à toute requête par l'IP du
+//! portail. Boucle arrêtable via [`STOP`] pour libérer le port 53 en sortie
+//! (ré-entrée sans échec de `bind`).
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};

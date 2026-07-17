@@ -1,9 +1,5 @@
-//! Détection automatique du format .mfd via la taille du fichier.
-//!
-//! Convention Proxmark / Flipper Zero :
-//! - Mini : 320 bytes
-//! - 1K   : 1024 bytes
-//! - 4K   : 4096 bytes
+//! Détection du format .mfd via la taille du fichier (convention Proxmark /
+//! Flipper Zero) : Mini 320 o, 1K 1024 o, 4K 4096 o.
 
 use crate::layout::ClassicType;
 

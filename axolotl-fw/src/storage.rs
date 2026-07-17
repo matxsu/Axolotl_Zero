@@ -16,10 +16,8 @@ use esp_idf_svc::fs::fatfs::Fatfs;
 const MOUNT_POINT: &str = "/sdcard";
 const FLASH_MOUNT: &str = "/spiflash";
 
-/// Trait minimal utilisé par les fonctions UI pour écrire un fichier sur le
-/// stockage actif (SD ou flash interne) sans exposer le type générique complet.
-/// Les lectures et listings passent directement par `std::fs` (cf. `main.rs`)
-/// car ils doivent scanner les DEUX racines `/sdcard` + `/spiflash`.
+/// Écriture d'un fichier sur le stockage actif (SD ou flash) sans exposer le
+/// type générique. Les lectures/listings passent par `std::fs` (2 racines).
 pub trait SdWrite {
     fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()>;
 }
@@ -28,11 +26,8 @@ pub struct SdStorage<'d, T = SpiDriver<'d>>
 where
     T: Borrow<SpiDriver<'d>> + 'd,
 {
-    // La Fatfs SD doit être ENREGISTRÉE dans le VFS (`esp_vfs_fat_register`) pour
-    // que `/sdcard` existe côté `std::fs`. `Fatfs::new_sdcard` ne fait que
-    // `ff_diskio_register_sdmmc` (couche disque), PAS le VFS — sans ce
-    // `MountedFatfs`, toute écriture `/sdcard/...` échoue en ENOENT (cf. le
-    // `failed to create whole tree` / `os error 2` observé). Idem `InternalFs`.
+    // Doit rester monté : `MountedFatfs` enregistre la FAT dans le VFS, sans quoi
+    // `/sdcard` n'existe pas côté `std::fs` et toute écriture échoue en ENOENT.
     _mounted: MountedFatfs<Fatfs<SdCardDriver<SdSpiHostDriver<'d, T>>>>,
 }
 
@@ -77,13 +72,9 @@ where
     /// Écrit `data` dans `/sdcard{path}` (crée ou écrase).
     pub fn write_file(&self, path: &str, data: &[u8]) -> anyhow::Result<()> {
         let full = format!("{}{}", MOUNT_POINT, path);
-        // Garantit l'arborescence (ex: /sdcard/NFC/dumps) avant l'écriture :
-        // le create_dir_all du `new()` peut échouer silencieusement si la SD a
-        // hoqueté au montage → sinon File::create renvoie ENOENT.
+        // Recrée l'arborescence avant l'écriture, sinon File::create renvoie un
+        // ENOENT trompeur. On logge l'échec au lieu de le swallow (vraie cause).
         if let Some(parent) = std::path::Path::new(&full).parent() {
-            // On NE swallow PLUS l'erreur : si la création échoue (carte en
-            // lecture seule, FAT corrompue, mount-root…), File::create plante
-            // ensuite avec un ENOENT trompeur. Ce warn donne la vraie cause.
             if let Err(e) = fs::create_dir_all(parent) {
                 log::warn!("SD create_dir_all {}: {}", parent.display(), e);
             }

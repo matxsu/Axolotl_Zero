@@ -23,12 +23,9 @@ pub struct SectorKey {
     pub key: [u8; 6],
 }
 
-/// Sérialise le dump au format .mfd en RÉINJECTANT les clés trouvées dans les
-/// trailers (la carte renvoie KeyA masquée à 00 ; un .mfd standard Proxmark/
-/// Flipper contient les vraies clés). Le dump en RAM reste inchangé.
-///
-/// Ce format permet de re-cloner plus tard depuis le fichier seul, sans
-/// re-scanner la carte source ni reconserver les clés à part.
+/// Sérialise le dump en .mfd en réinjectant les clés trouvées dans les trailers
+/// (la carte renvoie KeyA masquée) : re-clonable depuis le seul fichier. Le dump
+/// en RAM reste inchangé.
 pub fn dump_to_mfd_with_keys(dump: &MifareDump, keys: &[SectorKey]) -> Vec<u8> {
     let mut bytes = dump.to_mfd_bytes();
     let card_type = dump.card_type;
@@ -176,10 +173,8 @@ fn try_sector(
     uid4: &[u8; 4],
     found_keys: &mut Vec<SectorKey>,
 ) -> Option<bool> {
-    // ── Phase 0 : réutilise les clés déjà trouvées (dédupliquées par valeur) ──
-    // Optimisation critique : si tous les secteurs partagent la même clé, le
-    // dict complet (238 essais × ~280 ms) n'est tenté qu'une seule fois au lieu
-    // de 16.  Réduit le temps de dump d'~2 min à ~10 s sur les badges monoclé.
+    // Phase 0 : réessaie d'abord les clés déjà trouvées (dédupliquées). Un badge
+    // monoclé évite ainsi de rejouer le dict complet par secteur (~2 min → ~10 s).
     {
         let snapshot: Vec<SectorKey> = found_keys.to_vec();
         let mut tried: Vec<([u8; 6], u8)> = Vec::new();

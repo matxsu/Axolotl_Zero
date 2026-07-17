@@ -1,9 +1,6 @@
 //! Scan des réseaux Wi-Fi 2.4 GHz (mode station).
-//!
-//! Porté depuis `feature/wifi_attacks:src/wifi_scan.rs`. Adaptations pour
-//! l'intégration au menu de `main.rs` :
-//!   - `modem` emprunté (`impl Peripheral`) pour être réutilisable entre écrans ;
-//!   - bouton retour (`back`) → sortie propre → le modem est rendu à l'appelant.
+//! `modem` emprunté puis rendu à l'appelant en sortie, pour passer d'un écran à
+//! l'autre sans reboot.
 
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::delay::FreeRtos;

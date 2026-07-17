@@ -412,8 +412,7 @@ axolotl-zero/                    Workspace Cargo
         ├── index.html           Interface web embarquée (include_bytes!)
         ├── scan.rs              Scan réseaux 2.4 GHz (mode station)
         ├── sniff.rs             Promiscuous 802.11 + capture handshake WPA (.pcap)
-        ├── eviltwin.rs          Evil twin AP + portail captif (phishing creds)
-        ├── portals.rs           Portails captifs façon zphisher (servis depuis SD)
+        ├── eviltwin.rs          Evil twin AP + portail captif (page de login embarquée, capture creds)
         └── captive_dns.rs       Mini DNS captif (redirige tout vers le portail)
 ```
 
@@ -669,7 +668,7 @@ Les attaques de désauthentification et la création d'un AP rogue sont **techni
 ### Logicielles
 
 - **Mono-tâche** — pas de multi-threading Rust. Les opérations longues (dump NFC, capture Sub-GHz) bloquent l'UI. Acceptable pour un outil interactif.
-- **Pas de BLE** — la stack Bluetooth de l'ESP32-S3 est disponible mais non intégrée, hors scope v1
+- **BadUSB via Bluetooth LE** — le clavier HID passe par la radio BLE (`esp32-nimble`), pas par l'USB OTG natif (réservé au flash/console). L'hôte doit appairer le périphérique « Axolotl Keyboard »
 - **Pas de suspension / wake-up** — le device reste ON tant qu'il est alimenté. Pas de deep sleep implémenté.
 
 ---
@@ -679,7 +678,7 @@ Les attaques de désauthentification et la création d'un AP rogue sont **techni
 - [`docs/features/`](./docs/features/) — Spécifications détaillées par module
 - `hardware/schematics/` — Schémas KiCad (PDF export) — *à venir*
 - `hardware/bom.md` — Bill of materials complet — *à venir* (BOM synthétique en §2)
-- Cahier des charges (CDC v1.1) — document projet, hors dépôt
+- [`docs/axolotl_zero_cdc.docx`](./docs/axolotl_zero_cdc.docx) — Cahier des charges (CDC v1.1)
 
 ---
 

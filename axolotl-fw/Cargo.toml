@@ -6,9 +6,6 @@ edition = "2021"
 resolver = "2"
 rust-version = "1.82"
 
-[features]
-lab_payload = []
-
 [[bin]]
 name = "axolotl-fw"
 harness = false

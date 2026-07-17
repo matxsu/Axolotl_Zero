@@ -1,15 +1,6 @@
-//! Parsing des access bits MIFARE Classic.
-//!
-//! Le sector trailer (bloc 3 des secteurs 1K, ou bloc 15 des large 4K) :
-//! ```text
-//!   0..6   : KeyA (toujours lu en zéros)
-//!   6..9   : Access bits (3 bytes, avec redondance inversée)
-//!   9      : User byte (libre)
-//!   10..16 : KeyB
-//! ```
-//!
-//! Les access bits encodent (C1, C2, C3) par bloc (4 jeux : blocs 0,1,2 + trailer).
-//! Référence : NXP MF1S503xH datasheet §8.7.
+//! Parsing des access bits MIFARE Classic (sector trailer : KeyA / access bits
+//! à redondance inversée / KeyB). Encode (C1,C2,C3) par bloc.
+//! Réf : NXP MF1S503xH §8.7.
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BlockAccess {
@@ -58,10 +49,8 @@ impl AccessConditions {
         let b7 = bytes[1];
         let b8 = bytes[2];
 
-        // Layout (NXP MF1S503xH Table 6) — chaque nibble :
-        //   b6 low  = !C1[3..0],  b6 high = !C2[3..0]
-        //   b7 low  = !C3[3..0],  b7 high =  C1[3..0]
-        //   b8 low  =  C2[3..0],  b8 high =  C3[3..0]
+        // Layout NXP MF1S503xH Table 6, par nibble (low, high) :
+        // b6=(!C1,!C2), b7=(!C3,C1), b8=(C2,C3).
         let c1_inv = b6 & 0x0F;
         let c2_inv = (b6 >> 4) & 0x0F;
         let c3_inv = b7 & 0x0F;
